@@ -335,6 +335,47 @@ class TestKVTransferThread(unittest.TestCase):
         t.add_request(req)
         self.assertFalse(t.request_queue.empty())
 
+    def test_fatal_error_stops_before_processing_queued_followup(self):
+        t, _ = self._make_thread()
+        first = object()
+        followup = object()
+        root_cause = RuntimeError("first transfer failed")
+        t._handle_request = MagicMock(side_effect=root_cause)
+        t.add_request(first)
+        t.add_request(followup)
+
+        t.start()
+        t.join(timeout=5)
+
+        self.assertFalse(t.is_alive())
+        t._handle_request.assert_called_once_with(first)
+        self.assertIs(t._fatal_error, root_cause)
+        self.assertTrue(t.request_queue.empty())
+        self.assertEqual(t.request_queue.unfinished_tasks, 0)
+        with self.assertRaisesRegex(RuntimeError, "failed during asynchronous transfer") as exc_info:
+            t.raise_if_failed()
+        self.assertIs(exc_info.exception.__cause__, root_cause)
+        with self.assertRaisesRegex(RuntimeError, "failed during asynchronous transfer"):
+            t.add_request(object())
+
+    def test_device_initialization_failure_releases_ready_and_drains_queue(self):
+        t, store = self._make_thread()
+        root_cause = RuntimeError("set device failed")
+        store.set_device = MagicMock(side_effect=root_cause)
+        t.add_request(object())
+
+        t.start()
+        t.join(timeout=5)
+
+        self.assertFalse(t.is_alive())
+        self.assertTrue(t.ready_event.is_set())
+        self.assertIs(t._fatal_error, root_cause)
+        self.assertTrue(t.request_queue.empty())
+        self.assertEqual(t.request_queue.unfinished_tasks, 0)
+        with self.assertRaisesRegex(RuntimeError, "failed during asynchronous transfer") as exc_info:
+            t.raise_if_failed()
+        self.assertIs(exc_info.exception.__cause__, root_cause)
+
     def test_get_and_clear_finished_requests(self):
         t, _ = self._make_thread()
         t.set_finished_request("r1")
@@ -772,7 +813,7 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
 
 
 class TestGVALayerSendingThread(unittest.TestCase):
-    def _make_thread(self, copy_result=0, builders=None, pd_transfer_waiter=None):
+    def _make_thread(self, copy_result=0, builders=None):
         store = MagicMock()
         store.store.batch_copy.return_value = copy_result
         db = MagicMock()
@@ -791,7 +832,6 @@ class TestGVALayerSendingThread(unittest.TestCase):
             layer_save_finished_events=[layer_finished],
             sync_save_events=[MagicMock()],
             group_array_builders=builders,
-            pd_transfer_waiter=pd_transfer_waiter,
         )
         return thread, store, layer_finished
 
@@ -868,75 +908,11 @@ class TestGVALayerSendingThread(unittest.TestCase):
         self.assertEqual(thread.get_and_clear_finished_requests(), set())
         self.assertFalse(layer_finished.is_set())
 
-    def test_pd_read_finishes_before_layer_save_completion(self):
-        builder = MagicMock()
-        builder.build_addrs.return_value = LayerTransferArrays(
-            np.asarray([10]),
-            np.asarray([16]),
-            np.asarray([100]),
-        )
-        call_order = []
-
-        def wait_for_pd(layer_id):
-            call_order.append(("pd", layer_id))
-
-        thread, store, layer_finished = self._make_thread(
-            builders=[builder],
-            pd_transfer_waiter=wait_for_pd,
-        )
-        store.store.batch_copy.side_effect = lambda *_args: call_order.append(("save", 0)) or 0
-        tasks = [
-            LayerTransferTask(
-                layer_id=0,
-                block_ranges=[],
-                transfer_data=MagicMock(),
-                completion=TransferCompletion([], []),
-            )
-        ]
-        request = LayerSaveTask(layer_id=0, transfer_tasks=tasks)
-        thread.request_queue.put(request)
-
-        thread._handle_request(request)
-
-        self.assertEqual(call_order, [("save", 0), ("pd", 0)])
-        self.assertTrue(layer_finished.is_set())
-
-    def test_pd_read_failure_does_not_release_layer_save_gate(self):
-        builder = MagicMock()
-        builder.build_addrs.return_value = LayerTransferArrays(
-            np.asarray([10]),
-            np.asarray([16]),
-            np.asarray([100]),
-        )
-
-        def fail_pd_read(_layer_id):
-            raise RuntimeError("PD read failed")
-
-        thread, _, layer_finished = self._make_thread(
-            builders=[builder],
-            pd_transfer_waiter=fail_pd_read,
-        )
-        tasks = [
-            LayerTransferTask(
-                layer_id=0,
-                block_ranges=[],
-                transfer_data=MagicMock(),
-                completion=TransferCompletion([], []),
-            )
-        ]
-        request = LayerSaveTask(layer_id=0, transfer_tasks=tasks)
-        thread.request_queue.put(request)
-
-        with self.assertRaisesRegex(RuntimeError, "PD read failed"):
-            thread._handle_request(request)
-
-        self.assertFalse(layer_finished.is_set())
-
 
 class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
-    """PD and attention completion gate physical slot reuse."""
+    """L2G and attention completion gate AscendStore's internal slot reuse."""
 
-    def _make_thread(self, copy_result=0, builders=None, pd_transfer_waiter=None, attn_recorded=True):
+    def _make_thread(self, copy_result=0, builders=None, attn_recorded=True):
         store = MagicMock()
         store.store.batch_copy.return_value = copy_result
         db = MagicMock()
@@ -959,7 +935,6 @@ class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
             layer_save_finished_events=[layer_finished],
             sync_save_events=[MagicMock()],
             group_array_builders=builders,
-            pd_transfer_waiter=pd_transfer_waiter,
             sync_attn_events=[sync_attn],
             layer_attn_recorded_events=[attn_flag],
         )
@@ -987,15 +962,10 @@ class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
             ],
         )
 
-    def test_copy_runs_before_pd_and_slot_free(self):
+    def test_copy_runs_before_slot_free(self):
         call_order = []
-
-        def wait_for_pd(_layer_id):
-            call_order.append("pd")
-
         thread, store, layer_finished, _ = self._make_thread(
             builders=[self._make_builder()],
-            pd_transfer_waiter=wait_for_pd,
         )
         store.store.batch_copy.side_effect = lambda *_a: call_order.append("copy") or 0
         request = self._make_task()
@@ -1003,7 +973,7 @@ class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
 
         thread._handle_request(request)
 
-        self.assertEqual(call_order, ["copy", "pd"])
+        self.assertEqual(call_order, ["copy"])
         self.assertTrue(layer_finished.is_set())
 
     def test_slot_free_waits_for_attention_done(self):
@@ -1035,15 +1005,9 @@ class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
         sync_attn.synchronize.assert_called_once()
         self.assertTrue(layer_finished.is_set())
 
-    def test_control_only_save_waits_for_pd_and_attention_before_slot_free(self):
-        call_order = []
-
-        def wait_for_pd(_layer_id):
-            call_order.append("pd")
-
+    def test_control_only_save_waits_for_attention_before_slot_free(self):
         thread, store, layer_finished, sync_attn = self._make_thread(
             builders=[self._make_builder()],
-            pd_transfer_waiter=wait_for_pd,
             attn_recorded=False,
         )
         request = LayerSaveTask(layer_id=0, transfer_tasks=[])
@@ -1058,7 +1022,6 @@ class TestGVALayerSendingThreadEventSplit(unittest.TestCase):
         worker.start()
 
         self.assertFalse(done.wait(timeout=0.2))
-        self.assertEqual(call_order, ["pd"])
         self.assertFalse(layer_finished.is_set())
         thread.layer_attn_recorded_events[0].set()
         self.assertTrue(done.wait(timeout=5))
@@ -1101,6 +1064,37 @@ class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
 
 
 class TestGVALayerRecvingThread(unittest.TestCase):
+    def _make_reuse_thread(self, external_slot_release_waiter=None, save_failure_checker=None):
+        store = MagicMock()
+        store.store.batch_copy.return_value = 0
+        db = MagicMock()
+        db.group_block_len = {0: [16]}
+        builder = MagicMock()
+        builder.build_addrs.return_value = LayerTransferArrays(
+            addr_array=np.asarray([1000], dtype=np.int64),
+            size_array=np.asarray([16], dtype=np.int64),
+            gvas_array=np.asarray([2000], dtype=np.int64),
+        )
+        load_finished = [threading.Event(), threading.Event()]
+        save_finished = [threading.Event(), threading.Event()]
+        thread = KVCacheStoreLayerRecvingThread(
+            m_store=store,
+            token_database=db,
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            ready_event=threading.Event(),
+            get_event=threading.Event(),
+            layer_load_finished_events=load_finished,
+            layer_save_finished_events=save_finished,
+            num_layers=2,
+            group_array_builders=[builder],
+            external_slot_release_waiter=external_slot_release_waiter,
+            save_failure_checker=save_failure_checker,
+        )
+        return thread, store, load_finished, save_finished
+
     def test_h2d_stagger_sleeps_before_short_final_spin(self):
         thread = KVCacheStoreLayerRecvingThread.__new__(KVCacheStoreLayerRecvingThread)
         thread._get_h2d_stagger_delay_us = MagicMock(return_value=100)
@@ -1134,6 +1128,79 @@ class TestGVALayerRecvingThread(unittest.TestCase):
             thread._stagger_h2d_submit(layer_id=0)
 
         sleep.assert_not_called()
+
+    def test_h2d_waits_for_source_save_then_external_slot_release(self):
+        call_order = []
+        thread, store, _, save_finished = self._make_reuse_thread(
+            external_slot_release_waiter=lambda layer_id: call_order.append(("reuse", layer_id))
+        )
+        save_finished[0].set()
+        store.store.batch_copy.side_effect = lambda *_args: call_order.append(("h2d", 1)) or 0
+        task = LayerTransferTask(
+            layer_id=1,
+            block_ranges=[],
+            transfer_data=MagicMock(),
+            completion=TransferCompletion([], []),
+        )
+        load_task = LayerLoadTask(wait_for_save_layer=0, transfer_tasks=[task], layer_id=1)
+        thread.request_queue.put(load_task)
+
+        thread._handle_request(load_task)
+
+        self.assertEqual(call_order, [("reuse", 1), ("h2d", 1)])
+        self.assertFalse(save_finished[0].is_set())
+
+    def test_empty_load_waits_for_external_slot_release_before_finish(self):
+        observed_load_state = []
+        thread = None
+
+        def wait_for_release(layer_id):
+            assert thread is not None
+            observed_load_state.append(thread.layer_load_finished_events[layer_id].is_set())
+
+        thread, _, load_finished, _ = self._make_reuse_thread(external_slot_release_waiter=wait_for_release)
+        load_task = LayerLoadTask(wait_for_save_layer=None, transfer_tasks=[], layer_id=1)
+        thread.request_queue.put(load_task)
+
+        thread._handle_request(load_task)
+
+        self.assertEqual(observed_load_state, [False])
+        self.assertTrue(load_finished[1].is_set())
+
+    def test_external_slot_release_failure_prevents_h2d_and_completion(self):
+        def fail_release(_layer_id):
+            raise RuntimeError("external read failed")
+
+        thread, store, load_finished, _ = self._make_reuse_thread(
+            external_slot_release_waiter=fail_release
+        )
+        task = LayerTransferTask(
+            layer_id=1,
+            block_ranges=[],
+            transfer_data=MagicMock(),
+            completion=TransferCompletion([], []),
+        )
+        load_task = LayerLoadTask(wait_for_save_layer=None, transfer_tasks=[task], layer_id=1)
+        thread.request_queue.put(load_task)
+
+        with self.assertRaisesRegex(RuntimeError, "external read failed"):
+            thread._handle_request(load_task)
+
+        store.store.batch_copy.assert_not_called()
+        self.assertFalse(load_finished[1].is_set())
+
+    def test_source_save_failure_interrupts_receiver_wait(self):
+        save_failure_checker = MagicMock(side_effect=RuntimeError("save thread failed"))
+        thread, _, _, save_finished = self._make_reuse_thread(save_failure_checker=save_failure_checker)
+        save_finished[0] = MagicMock()
+        save_finished[0].wait.return_value = False
+        load_task = LayerLoadTask(wait_for_save_layer=0, transfer_tasks=[], layer_id=1)
+        thread.request_queue.put(load_task)
+
+        with self.assertRaisesRegex(RuntimeError, "save thread failed"):
+            thread._handle_request(load_task)
+
+        save_failure_checker.assert_called_once_with()
 
     def test_layer_transfer_releases_load_leases_after_copy(self):
         store = MagicMock()

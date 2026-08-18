@@ -50,6 +50,8 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
       indexer/main split registration.
     """
 
+    supports_layerwise_buffer_reuse = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -235,3 +237,16 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if worker is None or not hasattr(worker, "wait_for_layer_send"):
             return
         worker.wait_for_layer_send(layer_idx)
+
+    def wait_for_layer_reuse(self, layer_idx: int) -> None:
+        """Expose the READ_DONE gate using an AscendStore-local layer id."""
+        worker = self.connector_worker
+        if worker is None or not hasattr(worker, "wait_for_layer_reuse"):
+            return
+        worker.wait_for_layer_reuse(layer_idx)
+
+    def get_layerwise_reuse_layer_count(self) -> int | None:
+        worker = self.connector_worker
+        if worker is None or not hasattr(worker, "get_layerwise_reuse_layer_count"):
+            return None
+        return worker.get_layerwise_reuse_layer_count()

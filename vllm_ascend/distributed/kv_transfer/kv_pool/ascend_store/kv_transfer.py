@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import logging
 import queue
@@ -36,6 +37,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_transfer
 )
 
 _H2D_STAGGER_SPIN_US = 50
+_TRANSFER_FAILURE_POLL_INTERVAL_SECONDS = 1.0
 
 
 def _circular_shift(lst: list, offset: int) -> list:
@@ -116,6 +118,7 @@ class KVTransferThread(threading.Thread):
         self,
         request: ReqMeta | LayerMultiBlockReqMeta | LayerwisePreparation,
     ) -> torch.Tensor:
+        self.raise_if_failed()
         self.request_queue.put(request)
 
     def get_and_clear_finished_requests(
@@ -260,10 +263,26 @@ class KVTransferThread(threading.Thread):
         except Exception:
             pass
 
+    def _drain_pending_requests(self) -> None:
+        while True:
+            try:
+                self.request_queue.get_nowait()
+            except queue.Empty:
+                break
+            with contextlib.suppress(ValueError):
+                self.request_queue.task_done()
+
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
         self._set_os_thread_name()
-        self.m_store.set_device()
+        try:
+            self.m_store.set_device()
+        except Exception as e:
+            self._fatal_error = e
+            logger.exception("Failed to initialize KVCacheTransferThread(%s); stopping the thread.", self.name)
+            self._drain_pending_requests()
+            self.ready_event.set()
+            return
         self.ready_event.set()
         while True:
             try:
@@ -274,13 +293,23 @@ class KVTransferThread(threading.Thread):
                     continue
                 self._handle_request(request_data)
             except Exception as e:
-                self._fatal_error = e
-                logger.error(
-                    "Error in KVCacheTransferThread(%s). type=%s, error=%s. Check thread state and request processing.",
+                # A transfer failure invalidates the ordering guarantees for
+                # every task already queued behind it. Preserve the first root
+                # cause and stop instead of issuing more H2D/D2H operations.
+                if self._fatal_error is None:
+                    self._fatal_error = e
+                logger.exception(
+                    "Fatal error in KVCacheTransferThread(%s). type=%s, error=%s; stopping the thread.",
                     self.name,
                     type(e).__name__,
                     e,
                 )
+                # Do not leave queue.join() blocked after abandoning the
+                # failed item and its queued dependants.
+                with contextlib.suppress(ValueError):
+                    self.request_queue.task_done()
+                self._drain_pending_requests()
+                break
 
     def _handle_request(self, req_meta: Any):
         pass
@@ -872,6 +901,7 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
     def add_request(  # type: ignore[override]
         self, req_meta: list[LayerTransferTask] | LayerwisePreparation
     ) -> torch.Tensor:
+        self.raise_if_failed()
         self.request_queue.put(req_meta)
 
     def _handle_request(  # type: ignore[override]
@@ -1006,6 +1036,7 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
     def add_request(  # type: ignore[override]
         self, req_meta: LayerLoadTask
     ) -> torch.Tensor:
+        self.raise_if_failed()
         self.request_queue.put(req_meta)
 
     def _wait_for_save(self, layer_id: int) -> None:
@@ -1097,7 +1128,6 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
         group_array_builders: list[LayerTransferArrayBuilder] | None = None,
-        pd_transfer_waiter: Callable[[int], None] | None = None,
         sync_attn_events: list[torch.npu.Event] | None = None,
         layer_attn_recorded_events: list[threading.Event] | None = None,
     ):
@@ -1122,7 +1152,6 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
         self.group_array_builders = group_array_builders
-        self.pd_transfer_waiter = pd_transfer_waiter
         if group_array_builders is not None:
             self.transfer_array_builder = group_array_builders[0]
         else:
@@ -1163,7 +1192,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.sync_attn_events[physical_layer].synchronize()
 
     def _set_slot_free(self, physical_layer: int) -> None:
-        # slot_free = L2G copy done AND PD transfer done AND attention done.
+        # AscendStore's internal slot-free gate covers L2G and attention. Any
+        # external consumer is gated separately at the next H2D admission.
         assert not self.layer_save_finished_events[physical_layer].is_set(), (
             f"thread: {physical_layer} save failed "
         )
@@ -1173,6 +1203,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
     def add_request(  # type: ignore[override]
         self, req_meta: LayerSaveTask | LayerwisePreparation
     ) -> torch.Tensor:
+        self.raise_if_failed()
         self.request_queue.put(req_meta)
 
     def _handle_request(  # type: ignore[override]
@@ -1238,8 +1269,6 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             if res != 0:
                 raise RuntimeError(f"Layerwise {physical_layer} save batch_copy failed with return code {res}")
 
-        if self.pd_transfer_waiter is not None:
-            self.pd_transfer_waiter(physical_layer)
         self._wait_attention_done(physical_layer)
 
         if has_any_save:
@@ -1273,6 +1302,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         max_transfer_bytes: int = 0,
         group_array_builders: list[LayerTransferArrayBuilder] | None = None,
         load_lease_releaser: Callable[[set[str]], None] | None = None,
+        external_slot_release_waiter: Callable[[int], None] | None = None,
+        save_failure_checker: Callable[[], None] | None = None,
     ):
         super().__init__(
             m_store,
@@ -1293,6 +1324,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.max_transfer_bytes = max_transfer_bytes
         self.group_array_builders = group_array_builders
         self.load_lease_releaser = load_lease_releaser
+        self.external_slot_release_waiter = external_slot_release_waiter
+        self.save_failure_checker = save_failure_checker
         if group_array_builders is not None:
             self.transfer_array_builder = group_array_builders[0]
         else:
@@ -1313,9 +1346,26 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         logger.debug("Layer load event set: layer %d", layer_id)
         self.layer_load_finished_events[layer_id].set()
 
+    def _wait_for_source_save(self, layer_id: int) -> None:
+        while not self.layer_save_finished_events[layer_id].wait(
+            timeout=_TRANSFER_FAILURE_POLL_INTERVAL_SECONDS
+        ):
+            if self.save_failure_checker is not None:
+                self.save_failure_checker()
+            logger.info("Layerwise %d save wait timed out, keep waiting before load", layer_id)
+        if self.save_failure_checker is not None:
+            self.save_failure_checker()
+        logger.debug("Layer save event cleared: layer %d", layer_id)
+        self.layer_save_finished_events[layer_id].clear()
+
+    def _wait_for_external_slot_release(self, layer_id: int) -> None:
+        if self.external_slot_release_waiter is not None:
+            self.external_slot_release_waiter(layer_id)
+
     def add_request(  # type: ignore[override]
         self, req_meta: LayerLoadTask | LayerwisePreparation
     ) -> torch.Tensor:
+        self.raise_if_failed()
         self.request_queue.put(req_meta)
 
     def _get_h2d_stagger_delay_us(self, layer_id: int) -> int:
@@ -1353,10 +1403,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
         if len(transfer_tasks) == 0:
             if wait_for_save is not None:
-                while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
-                    logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
-                logger.debug("Layer save event cleared: layer %d", wait_for_save)
-                self.layer_save_finished_events[wait_for_save].clear()
+                self._wait_for_source_save(wait_for_save)
+            self._wait_for_external_slot_release(layer_id)
             self._set_layer_load_done(layer_id)
             self.request_queue.task_done()
             return
@@ -1378,15 +1426,13 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             task_arrays.append((task, arrays))
 
         if not task_arrays:
+            self._wait_for_external_slot_release(layer_id)
             self._set_layer_load_done(layer_id)
             self.request_queue.task_done()
             return
 
         if wait_for_save is not None:
-            while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
-                logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
-            logger.debug("Layer save event cleared: layer %d", wait_for_save)
-            self.layer_save_finished_events[wait_for_save].clear()
+            self._wait_for_source_save(wait_for_save)
 
         if attention_start_gate is not None:
             while not attention_start_gate.wait(timeout=10):
@@ -1406,6 +1452,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         gvas_array = np.concatenate(all_gvas) if len(all_gvas) > 1 else all_gvas[0]
         addr_array = np.concatenate(all_addrs) if len(all_addrs) > 1 else all_addrs[0]
         size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
+        self._wait_for_external_slot_release(layer_id)
         res = self._batch_copy_with_limits(
             gvas_array,
             addr_array,

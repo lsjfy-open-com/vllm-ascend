@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -443,7 +444,8 @@ class SFAPDCpuOffloadProducerWorker:
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, engine_id: str):
         # Preserve the Mooncake worker's transfer-engine timeout setup. The
         # memfabric engine reads this during construction.
-        os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
+        self.pd_read_timeout_seconds = get_transfer_timeout_value()
+        os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(self.pd_read_timeout_seconds)
         self._backend = _resolve_kv_transfer_backend(vllm_config)
         if self._backend != BACKEND_MEMFABRIC:
             raise RuntimeError(
@@ -477,6 +479,9 @@ class SFAPDCpuOffloadProducerWorker:
         # physical storage slot so reuse is safe across layer and step
         # boundaries, including the last -> first transition of a reuse ring.
         self.layer_storage_slots: dict[int, tuple[int, ...]] = {}
+        # AscendStore reports model-local layer ordinals. Keep a stable mapping
+        # to the layer ids derived from this worker's registered cache names.
+        self.layer_reuse_order: tuple[int, ...] = ()
         self.current_layer = 0
         self.kv_send_layer_thread: MembPullSendingThread | None = None
         # Layers whose PD send was already dispatched at scatter time by
@@ -664,6 +669,7 @@ class SFAPDCpuOffloadProducerWorker:
         # Main and indexer storage are tracked independently: a main-only layer
         # can still share its main slot with a later layer that owns an indexer.
         self.layer_storage_slots = self._infer_layer_storage_slots(self.layer_metadata)
+        self.layer_reuse_order = tuple(sorted(self.layer_storage_slots))
 
         register_regions = collect_storage_merged_register_regions(kv_caches)
         validate_register_region_count(register_regions)
@@ -828,7 +834,13 @@ class SFAPDCpuOffloadProducerWorker:
     ) -> None:
         if event is None or self.kv_send_layer_thread is None:
             return
-        while not event.wait(timeout=PD_READ_WAIT_LOG_INTERVAL_SECONDS):
+        timeout_value = getattr(self, "pd_read_timeout_seconds", None)
+        timeout_seconds = float(get_transfer_timeout_value() if timeout_value is None else timeout_value)
+        deadline = time.monotonic() + max(timeout_seconds, 0.0)
+        while True:
+            remaining = max(deadline - time.monotonic(), 0.0)
+            if event.wait(timeout=min(PD_READ_WAIT_LOG_INTERVAL_SECONDS, remaining)):
+                break
             error = error_getter()
             if error is not None:
                 raise RuntimeError(f"D failed to read {description}: {error}")
@@ -838,6 +850,8 @@ class SFAPDCpuOffloadProducerWorker:
                 raise RuntimeError(
                     f"SFAPD P-side send thread stopped while waiting for D to read {description}{detail}"
                 )
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out after {timeout_seconds:g}s waiting for D to read {description}")
             logger.info("Waiting for D to read %s; keep waiting", description)
 
         error = error_getter()
@@ -853,14 +867,27 @@ class SFAPDCpuOffloadProducerWorker:
         """
         if self.kv_send_layer_thread is None:
             return
-        storage_slots = self.layer_storage_slots.get(layer_idx, ())
-        if storage_slots:
-            for slot_id in storage_slots:
-                self._wait_for_pd_read_completion(
-                    self.kv_send_layer_thread.get_storage_send_event(slot_id),
-                    lambda slot_id=slot_id: self.kv_send_layer_thread.get_storage_error(slot_id),
-                    f"physical KV storage slot {slot_id} for layer {layer_idx}",
-                )
+        if layer_idx not in self.layer_storage_slots:
+            raise RuntimeError(f"SFA layerwise reuse mapping is missing layer {layer_idx}")
+        for slot_id in self.layer_storage_slots[layer_idx]:
+            self._wait_for_pd_read_completion(
+                self.kv_send_layer_thread.get_storage_send_event(slot_id),
+                lambda slot_id=slot_id: self.kv_send_layer_thread.get_storage_error(slot_id),
+                f"physical KV storage slot {slot_id} for layer {layer_idx}",
+            )
+
+    def get_layerwise_reuse_layer_count(self) -> int:
+        return len(self.layer_reuse_order)
+
+    def wait_for_layer_reuse(self, local_layer_idx: int) -> None:
+        """Wait by the model-local ordinal supplied by AscendStore."""
+        layer_order = self.layer_reuse_order or tuple(sorted(self.layer_storage_slots))
+        if not 0 <= local_layer_idx < len(layer_order):
+            raise RuntimeError(
+                "SFA layerwise reuse layout does not contain local layer "
+                f"{local_layer_idx}; registered layer ids are {layer_order}"
+            )
+        self.wait_for_layer_send(layer_order[local_layer_idx])
 
     def shutdown(self) -> None:
         if self.kv_send_layer_thread is not None:

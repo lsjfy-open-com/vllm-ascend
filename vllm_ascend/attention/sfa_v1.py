@@ -41,8 +41,8 @@ from vllm_ascend.attention.utils import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
 from vllm_ascend.distributed.kv_transfer.kv_offload_decode.kv_offload_decode_manager import (
-    OFFLOAD_KV_CACHE_TUPLE_LEN,
     OFFLOAD_K_CACHE_NPU_INDEX,
+    OFFLOAD_KV_CACHE_TUPLE_LEN,
     OFFLOAD_V_CACHE_NPU_INDEX,
 )
 from vllm_ascend.distributed.utils import all_gather_async
@@ -1911,9 +1911,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.has_indexer:
                 assert k_li is not None
                 k_li = self._get_full_kv(k_li, attn_metadata)
-
-        if kv_cache is not None and self.is_kv_producer:
-            attn_metadata.reshape_cache_event = torch.npu.Event()
 
         if kv_cache is not None and self.has_indexer:
             assert k_li is not None

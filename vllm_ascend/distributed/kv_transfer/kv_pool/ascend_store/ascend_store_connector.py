@@ -197,12 +197,19 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
-    def set_layerwise_pd_transfer_waiter(self, waiter: Callable[[int], None]) -> None:
-        """Make layerwise save completion include co-located PD reads."""
+    def set_external_slot_release_waiter(self, waiter: Callable[[int], None]) -> bool:
+        """Wait for sibling transfers before AscendStore overwrites a slot."""
         worker = getattr(self, "connector_worker", None)
         if not self.use_gva_layerwise or worker is None:
-            return
-        worker.set_layerwise_pd_transfer_waiter(waiter)
+            return False
+        worker.set_external_slot_release_waiter(waiter)
+        return True
+
+    def get_external_slot_release_layer_count(self) -> int | None:
+        worker = getattr(self, "connector_worker", None)
+        if not self.use_gva_layerwise or worker is None:
+            return None
+        return worker.num_layers
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None

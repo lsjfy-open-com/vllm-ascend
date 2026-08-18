@@ -74,6 +74,8 @@ from vllm_ascend.memcache_comm_fence import (
     reset_attention_compute_start_gates,
 )
 
+_LAYER_TRANSFER_FAILURE_POLL_INTERVAL_SECONDS = 1.0
+
 
 class KVPoolWorker:
     # The main class for the cache engine.
@@ -317,7 +319,7 @@ class KVPoolWorker:
         self.kv_send_thread: KVTransferThread | None = None
         self.kv_recv_thread: KVTransferThread | None = None
         self._transfer_threads_started = False
-        self._layerwise_pd_transfer_waiter: Callable[[int], None] | None = None
+        self.external_slot_release_waiter: Callable[[int], None] | None = None
         self.group_num_layers: dict[int, int] = {}
         self.group_block_len: dict[int, list[int]] = {}
         self.page_size_bytes = 0
@@ -440,12 +442,12 @@ class KVPoolWorker:
                     self.layerwise_max_transfer_blocks,
                     self.layerwise_max_transfer_bytes,
                     group_array_builders=self._build_group_transfer_array_builders(),
-                    pd_transfer_waiter=self._layerwise_pd_transfer_waiter,
                     sync_attn_events=self.sync_attn_events,
                     layer_attn_recorded_events=self.layer_attn_recorded_events,
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
+                self.kv_send_thread.raise_if_failed()
             elif self.kv_role in ["kv_producer", "kv_both"]:
                 ready_event_sending = threading.Event()
                 self.kv_send_thread = KVCacheStoreKeyLayerSendingThread(
@@ -463,6 +465,7 @@ class KVPoolWorker:
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
+                self.kv_send_thread.raise_if_failed()
             ready_event = threading.Event()
             if self.use_gva_layerwise:
                 self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
@@ -482,6 +485,10 @@ class KVPoolWorker:
                     self.layerwise_max_transfer_bytes,
                     group_array_builders=self._build_group_transfer_array_builders(),
                     load_lease_releaser=self._layerwise_transfer_preparer.release_finished_load_leases,
+                    external_slot_release_waiter=self.external_slot_release_waiter,
+                    save_failure_checker=(
+                        self.kv_send_thread.raise_if_failed if self.kv_send_thread is not None else None
+                    ),
                 )
             else:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
@@ -499,6 +506,7 @@ class KVPoolWorker:
                 )
             self.kv_recv_thread.start()
             ready_event.wait()
+            self.kv_recv_thread.raise_if_failed()
         else:
             if self.kv_role in ["kv_producer", "kv_both"] or self.consumer_is_to_put:
                 ready_event_sending = threading.Event()
@@ -517,6 +525,7 @@ class KVPoolWorker:
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
+                self.kv_send_thread.raise_if_failed()
             if self.load_async:
                 ready_event = threading.Event()
                 self.kv_recv_thread = KVCacheStoreRecvingThread(
@@ -530,14 +539,13 @@ class KVPoolWorker:
                 )
                 self.kv_recv_thread.start()
                 ready_event.wait()
+                self.kv_recv_thread.raise_if_failed()
         self._transfer_threads_started = True
 
-    def set_layerwise_pd_transfer_waiter(self, waiter: Callable[[int], None]) -> None:
-        if not self.layerwise_offload:
-            return
-        self._layerwise_pd_transfer_waiter = waiter
-        if isinstance(self.kv_send_thread, KVCacheStoreLayerSendingThread):
-            self.kv_send_thread.pd_transfer_waiter = waiter
+    def set_external_slot_release_waiter(self, waiter: Callable[[int], None]) -> None:
+        self.external_slot_release_waiter = waiter
+        if isinstance(self.kv_recv_thread, KVCacheStoreLayerRecvingThread):
+            self.kv_recv_thread.external_slot_release_waiter = waiter
 
     def _build_cache_coordinator(self, vllm_config: VllmConfig) -> AscendStoreCoordinator | None:
         if self.kv_cache_config is None or not self.use_hybrid:
@@ -1185,8 +1193,12 @@ class KVPoolWorker:
         )
         if not should_wait:
             self.layer_load_finished_events[self.current_layer].clear()
+            if self.external_slot_release_waiter is not None:
+                self.external_slot_release_waiter(self.current_layer)
             return
-        while not self.layer_load_finished_events[self.current_layer].wait(timeout=10):
+        while not self.layer_load_finished_events[self.current_layer].wait(
+            timeout=_LAYER_TRANSFER_FAILURE_POLL_INTERVAL_SECONDS
+        ):
             self.kv_recv_thread.raise_if_failed()
             logger.info("Layerwise %d load not done, keep waiting", self.current_layer)
         logger.debug(">>>>>>>>>>>>>>>>>>>> clear load layer %d", self.current_layer)

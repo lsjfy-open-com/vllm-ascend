@@ -821,6 +821,22 @@ def test_pd_read_wait_fails_when_send_thread_stops():
         worker.wait_for_layer_send(0)
 
 
+def test_pd_read_wait_times_out_while_send_thread_is_alive():
+    event = MagicMock()
+    event.wait.return_value = False
+    send_thread = MagicMock()
+    send_thread.get_storage_send_event.return_value = event
+    send_thread.get_storage_error.return_value = None
+    send_thread.is_alive.return_value = True
+    worker = SFAPDCpuOffloadProducerWorker.__new__(SFAPDCpuOffloadProducerWorker)
+    worker.kv_send_layer_thread = send_thread
+    worker.layer_storage_slots = {0: (0,)}
+    worker.pd_read_timeout_seconds = 0
+
+    with pytest.raises(TimeoutError, match="Timed out after 0s"):
+        worker.wait_for_layer_send(0)
+
+
 def test_pd_read_wait_propagates_read_failed():
     event = MagicMock()
     event.wait.return_value = True
@@ -833,6 +849,26 @@ def test_pd_read_wait_propagates_read_failed():
 
     with pytest.raises(RuntimeError, match="memfabric read failed"):
         worker.wait_for_layer_send(0)
+
+
+def test_pd_read_wait_rejects_missing_layer_mapping():
+    worker = SFAPDCpuOffloadProducerWorker.__new__(SFAPDCpuOffloadProducerWorker)
+    worker.kv_send_layer_thread = MagicMock()
+    worker.layer_storage_slots = {}
+
+    with pytest.raises(RuntimeError, match="mapping is missing layer 3"):
+        worker.wait_for_layer_send(3)
+
+
+def test_pd_reuse_maps_local_ordinal_to_registered_layer_id():
+    worker = SFAPDCpuOffloadProducerWorker.__new__(SFAPDCpuOffloadProducerWorker)
+    worker.layer_storage_slots = {20: (0,), 21: (1,)}
+    worker.layer_reuse_order = (20, 21)
+    worker.wait_for_layer_send = MagicMock()
+
+    worker.wait_for_layer_reuse(1)
+
+    worker.wait_for_layer_send.assert_called_once_with(21)
 
 
 def test_save_kv_layer_requires_send_thread_without_marking_dispatched():
@@ -1098,6 +1134,15 @@ def test_connector_shutdown_delegates_to_active_components():
 
     connector.connector_worker.shutdown.assert_called_once_with()
     connector.connector_scheduler.shutdown.assert_called_once_with()
+
+
+def test_connector_layerwise_reuse_wait_delegates_to_read_done_gate():
+    connector = SFAPDCpuOffloadConnector.__new__(SFAPDCpuOffloadConnector)
+    connector.connector_worker = MagicMock()
+
+    connector.wait_for_layer_reuse(3)
+
+    connector.connector_worker.wait_for_layer_reuse.assert_called_once_with(3)
 
 
 def _make_contributor_read_thread(

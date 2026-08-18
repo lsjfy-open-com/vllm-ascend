@@ -162,7 +162,7 @@ class TestKVPoolWorkerEarlyDispatch(unittest.TestCase):
         worker.prefetch_layer_map = {}
         worker.hf_config = MagicMock()
         worker.hf_config.num_hidden_layers = num_layers
-        worker._layerwise_pd_transfer_waiter = None
+        worker.external_slot_release_waiter = None
         worker.layerwise_offload = False
         return worker
 
@@ -1791,6 +1791,8 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         worker.prefetch_layer_map = {2: 0}
         worker.layer_save_tasks = [[], [], []]
         worker.sync_save_events = [MagicMock() for _ in range(3)]
+        worker.sync_attn_events = [MagicMock() for _ in range(3)]
+        worker.layer_attn_recorded_events = [threading.Event() for _ in range(3)]
         worker.layer_save_finished_events = [threading.Event() for _ in range(3)]
         worker.layer_save_finished_events[0].set()
         worker.layer_save_finished_events[1].set()
@@ -1804,28 +1806,20 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         self.assertFalse(worker.layer_save_finished_events[1].is_set())
         self.assertFalse(worker.layer_save_finished_events[2].is_set())
 
-    def test_empty_layer_save_waits_for_pd_before_completion(self):
+    def test_layer_entry_without_load_waits_for_external_slot_release(self):
         worker = self._make_worker()
         worker.num_layers = 2
         worker.current_layer = 0
-        worker.layerwise_offload = True
-        worker.prefetch_layer_map = {1: 0}
-        worker.layer_save_tasks = [[], []]
-        worker.sync_save_events = [MagicMock(), MagicMock()]
-        worker.layer_save_finished_events = [threading.Event(), threading.Event()]
-        layer_finished = worker.layer_save_finished_events[0]
+        worker.prefetch_layer_map = {}
+        worker.layer_load_tasks = [[], []]
+        worker.layer_load_finished_events = [threading.Event(), threading.Event()]
+        worker.kv_recv_thread = MagicMock()
+        worker._submit_ready_layer_loads = MagicMock()
+        worker.external_slot_release_waiter = MagicMock()
 
-        def wait_for_pd(layer_id):
-            self.assertEqual(layer_id, 0)
-            self.assertFalse(layer_finished.is_set())
+        worker.wait_for_layer_load()
 
-        worker._layerwise_pd_transfer_waiter = MagicMock(side_effect=wait_for_pd)
-        worker.kv_send_thread = MagicMock()
-
-        worker.save_kv_layer(MagicMock())
-
-        worker._layerwise_pd_transfer_waiter.assert_called_once_with(0)
-        self.assertTrue(layer_finished.is_set())
+        worker.external_slot_release_waiter.assert_called_once_with(0)
 
     def test_alloc_gvas_for_save_stores_only_planned_range(self):
         worker = self._make_worker()

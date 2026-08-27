@@ -904,6 +904,166 @@ at::Tensor restore_tensor(uintptr_t ptr_val, const std::vector<int64_t>& shape,
     return torch::from_blob(reinterpret_cast<void*>(ptr_val), shape, options);
 }
 
+namespace {
+
+void check_current_kv_index_tensor(const at::Tensor& tensor,
+                                   const torch::ScalarType dtype,
+                                   const char* name) {
+    TORCH_CHECK(tensor.device().is_cpu(), name, " must be a CPU tensor");
+    TORCH_CHECK(tensor.scalar_type() == dtype, name, " has an invalid dtype");
+    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+struct CurrentKvIndexCopyPayload {
+    at::Tensor slot_mapping;
+    at::Tensor src_idx_buffer;
+    at::Tensor dst_idx_buffer;
+    at::Tensor count_buffer;
+    int32_t num_actual_tokens;
+    int32_t max_num_tokens;
+    int64_t num_host_slots;
+};
+
+std::unique_ptr<CurrentKvIndexCopyPayload>
+make_current_kv_index_copy_payload(
+    const at::Tensor& slot_mapping,
+    const int32_t num_actual_tokens,
+    const int32_t max_num_tokens,
+    const int64_t num_host_slots,
+    const at::Tensor& src_idx_buffer,
+    const at::Tensor& dst_idx_buffer,
+    const at::Tensor& count_buffer) {
+    check_current_kv_index_tensor(
+        slot_mapping, torch::kInt64, "slot_mapping");
+    check_current_kv_index_tensor(
+        src_idx_buffer, torch::kInt64, "src_idx_buffer");
+    check_current_kv_index_tensor(
+        dst_idx_buffer, torch::kInt64, "dst_idx_buffer");
+    check_current_kv_index_tensor(
+        count_buffer, torch::kInt32, "count_buffer");
+    TORCH_CHECK(num_actual_tokens >= 0,
+                "num_actual_tokens must not be negative");
+    TORCH_CHECK(max_num_tokens > 0, "max_num_tokens must be positive");
+    TORCH_CHECK(num_actual_tokens <= max_num_tokens,
+                "num_actual_tokens exceeds max_num_tokens");
+    TORCH_CHECK(num_host_slots > 0, "num_host_slots must be positive");
+    TORCH_CHECK(slot_mapping.numel() >= num_actual_tokens,
+                "slot_mapping is smaller than num_actual_tokens");
+    TORCH_CHECK(src_idx_buffer.numel() >= max_num_tokens,
+                "src_idx_buffer is too small");
+    TORCH_CHECK(dst_idx_buffer.numel() >= max_num_tokens,
+                "dst_idx_buffer is too small");
+    TORCH_CHECK(count_buffer.numel() >= 1, "count_buffer is empty");
+
+    return std::make_unique<CurrentKvIndexCopyPayload>(
+        CurrentKvIndexCopyPayload{
+            slot_mapping,
+            src_idx_buffer,
+            dst_idx_buffer,
+            count_buffer,
+            num_actual_tokens,
+            max_num_tokens,
+            num_host_slots,
+        });
+}
+
+void build_current_kv_index_copy_descriptors(
+    CurrentKvIndexCopyPayload* payload) noexcept {
+    if (payload == nullptr) {
+        return;
+    }
+    const auto* slots = payload->slot_mapping.data_ptr<int64_t>();
+    auto* src_idx = payload->src_idx_buffer.data_ptr<int64_t>();
+    auto* dst_idx = payload->dst_idx_buffer.data_ptr<int64_t>();
+    auto* count = payload->count_buffer.data_ptr<int32_t>();
+    int32_t num_copies = 0;
+
+    for (int32_t token_idx = 0;
+         token_idx < payload->num_actual_tokens;
+         ++token_idx) {
+        const int64_t slot = slots[token_idx];
+        if (slot < 0 || slot >= payload->num_host_slots) {
+            continue;
+        }
+        src_idx[num_copies] = token_idx;
+        dst_idx[num_copies] = slot;
+        ++num_copies;
+    }
+
+    if (num_copies > 0) {
+        const int64_t last_src = src_idx[num_copies - 1];
+        const int64_t last_dst = dst_idx[num_copies - 1];
+        for (int32_t i = num_copies; i < payload->max_num_tokens; ++i) {
+            src_idx[i] = last_src;
+            dst_idx[i] = last_dst;
+        }
+    } else {
+        for (int32_t i = 0; i < payload->max_num_tokens; ++i) {
+            src_idx[i] = 0;
+            dst_idx[i] = 0;
+        }
+    }
+    count[0] = num_copies;
+}
+
+int32_t compute_current_kv_index_copy_descriptors(
+    const at::Tensor& slot_mapping,
+    const int32_t num_actual_tokens,
+    const int32_t max_num_tokens,
+    const int64_t num_host_slots,
+    const at::Tensor& src_idx_buffer,
+    const at::Tensor& dst_idx_buffer,
+    const at::Tensor& count_buffer) {
+    auto payload = make_current_kv_index_copy_payload(
+        slot_mapping,
+        num_actual_tokens,
+        max_num_tokens,
+        num_host_slots,
+        src_idx_buffer,
+        dst_idx_buffer,
+        count_buffer);
+    build_current_kv_index_copy_descriptors(payload.get());
+    return count_buffer.data_ptr<int32_t>()[0];
+}
+
+void current_kv_index_copy_descriptor_callback(void* args) noexcept {
+    build_current_kv_index_copy_descriptors(
+        static_cast<CurrentKvIndexCopyPayload*>(args));
+}
+
+void enqueue_current_kv_index_copy_descriptors(
+    const at::Tensor& slot_mapping,
+    const int32_t num_actual_tokens,
+    const int32_t max_num_tokens,
+    const int64_t num_host_slots,
+    const at::Tensor& src_idx_buffer,
+    const at::Tensor& dst_idx_buffer,
+    const at::Tensor& count_buffer) {
+    auto payload = make_current_kv_index_copy_payload(
+        slot_mapping,
+        num_actual_tokens,
+        max_num_tokens,
+        num_host_slots,
+        src_idx_buffer,
+        dst_idx_buffer,
+        count_buffer);
+    auto* raw_payload = payload.release();
+    const aclError ret = aclrtLaunchHostFunc(
+        c10_npu::getCurrentNPUStream().stream(),
+        current_kv_index_copy_descriptor_callback,
+        raw_payload);
+    if (ret != ACL_SUCCESS) {
+        delete raw_payload;
+    }
+    TORCH_CHECK(
+        ret == ACL_SUCCESS,
+        "aclrtLaunchHostFunc for current-token index_copy descriptors failed, "
+        "error code: ",
+        ret);
+}
+
+}  // namespace
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     namespace py = pybind11;
@@ -933,4 +1093,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             return restore_tensor(ptr_val, shape, torch::kInt16);
         },
         "Create a non-owning CPU int16 tensor view for a shared GVA");
+    m.def(
+        "compute_current_kv_index_copy_descriptors",
+        &compute_current_kv_index_copy_descriptors,
+        "Synchronously compute current-token index_copy src/dst indices");
+    m.def(
+        "enqueue_current_kv_index_copy_descriptors",
+        &enqueue_current_kv_index_copy_descriptors,
+        "Enqueue a replay-safe current-token index_copy descriptor callback");
 }

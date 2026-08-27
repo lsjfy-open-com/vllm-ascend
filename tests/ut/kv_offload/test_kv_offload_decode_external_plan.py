@@ -62,6 +62,7 @@ def _make_plan_manager():
     manager.fused_overlap_plan_topk = None
     manager.fused_overlap_plan_num_tokens = 0
     manager.fused_overlap_plan_membership_map = None
+    manager.d2h_index_copy_bypass = False
     pointer_names = (
         "lru_req_ids_ptr",
         "lru_topk_indices_ptr",

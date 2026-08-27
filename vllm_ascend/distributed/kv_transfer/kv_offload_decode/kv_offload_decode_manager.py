@@ -278,6 +278,7 @@ class KVOffloadDecodeManager:
             kv_transfer_extra_config(vllm_config),
             use_fused_overlap_offload=self.use_fused_overlap,
         )
+        self.d2h_index_copy_bypass = self.uses_mooncake_host
         self.runner_host_pool: DSAHostKVPool | None = None
 
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
@@ -290,6 +291,7 @@ class KVOffloadDecodeManager:
             self.max_num_tokens,
             self.max_num_reqs * decode_width,
         )
+        self.max_d2h_index_copy_tokens = self.max_num_topk_rows
         self.fused_overlap_membership_map: torch.Tensor | None = None
         self.fused_overlap_membership_map_rows = 0
         self.fused_overlap_membership_region: DSAHostMemoryRegion | None = None
@@ -758,6 +760,46 @@ class KVOffloadDecodeManager:
             self.current_kv_by_layer: dict[
                 int, tuple[torch.Tensor, torch.Tensor]
             ] = {}
+            if self.d2h_index_copy_bypass and self.tp_rank == 0:
+                self.d2h_slot_mapping_cpu = torch.zeros(
+                    self.max_d2h_index_copy_tokens,
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self.d2h_src_idx_cpu = torch.zeros(
+                    self.max_d2h_index_copy_tokens,
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self.d2h_dst_idx_cpu = torch.zeros(
+                    self.max_d2h_index_copy_tokens,
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self.d2h_index_count_cpu = torch.zeros(
+                    1,
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self.d2h_src_idx_npu = torch.zeros(
+                    self.max_d2h_index_copy_tokens,
+                    dtype=torch.int64,
+                    device=device,
+                )
+                self.d2h_dst_idx_npu = torch.zeros(
+                    self.max_d2h_index_copy_tokens,
+                    dtype=torch.int64,
+                    device=device,
+                )
+                self.d2h_index_count_npu = torch.zeros(
+                    1,
+                    dtype=torch.int32,
+                    device=device,
+                )
         self.d2h_src_ptrs_npu = torch.empty(
             d2h_descriptor_rows, dtype=torch.int64, device=device
         )
@@ -1092,6 +1134,7 @@ class KVOffloadDecodeManager:
             and self.use_fused_overlap
             and capturing
             and not has_prefill
+            and not self.d2h_index_copy_bypass
         )
         if not use_side_stream:
             self._offload_new_kv_on_current_stream(
@@ -1103,6 +1146,7 @@ class KVOffloadDecodeManager:
                 k,
                 v,
                 has_prefill,
+                capturing,
             )
             return
 
@@ -1118,6 +1162,7 @@ class KVOffloadDecodeManager:
                 k,
                 v,
                 has_prefill,
+                capturing,
             )
 
     def _offload_new_kv_on_current_stream(
@@ -1130,6 +1175,7 @@ class KVOffloadDecodeManager:
         k: torch.Tensor | None,  # decode: k/v -> cache_cpu[slot]
         v: torch.Tensor | None,  # decode: k/v -> cache_cpu[slot]
         has_prefill: bool = False,
+        capturing: bool = False,
     ) -> None:
         # the has_prefill path (NPU paged cache -> CPU pool D2H) only exists
         # for single-node PD-colocate debug.
@@ -1155,6 +1201,16 @@ class KVOffloadDecodeManager:
             if k is None or v is None:
                 raise ValueError("decode offload requires current-token K/V")
             device = k.device
+            if self.d2h_index_copy_bypass:
+                self._offload_new_kv_via_index_copy(
+                    slot_mapping=slot_mapping,
+                    k_cache_cpu=k_cache_cpu,
+                    v_cache_cpu=v_cache_cpu,
+                    k=k,
+                    v=v,
+                    capturing=capturing,
+                )
+                return
 
         slots = slot_mapping.reshape(-1).to(device=device, dtype=torch.int64)
         token_count = slots.numel()
@@ -1219,6 +1275,103 @@ class KVOffloadDecodeManager:
         )
         if result not in (None, 0):
             raise RuntimeError(f"memfabric D2H sparse_copy failed with result={result}")
+
+    def _offload_new_kv_via_index_copy(
+        self,
+        *,
+        slot_mapping: torch.Tensor,
+        k_cache_cpu: torch.Tensor,
+        v_cache_cpu: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        capturing: bool,
+    ) -> None:
+        """Write current-token K/V into the Mooncake shared Host pool."""
+        token_dim_k = self.token_size_bytes_k // k.element_size()
+        token_dim_v = self.token_size_bytes_v // v.element_size()
+        k_rows = k.reshape(-1, token_dim_k)
+        v_rows = v.reshape(-1, token_dim_v)
+        if not k_rows.is_contiguous():
+            k_rows = k_rows.contiguous()
+        if not v_rows.is_contiguous():
+            v_rows = v_rows.contiguous()
+        flat_host_k = k_cache_cpu.reshape(-1, token_dim_k)
+        flat_host_v = v_cache_cpu.reshape(-1, token_dim_v)
+        slots = slot_mapping.reshape(-1).to(device=k.device, dtype=torch.int64)
+        token_count = slots.numel()
+        if token_count == 0:
+            return
+        if token_count > self.max_d2h_index_copy_tokens:
+            raise ValueError(
+                "KV offload decode rows exceed index_copy capacity, "
+                f"got {token_count}, "
+                f"capacity={self.max_d2h_index_copy_tokens}"
+            )
+        if k_rows.shape[0] != token_count or v_rows.shape[0] != token_count:
+            raise ValueError("decode K/V row counts must match slot_mapping")
+        if flat_host_k.device != k.device or flat_host_v.device != v.device:
+            raise RuntimeError(
+                "Mooncake Host views and current K/V must share one NPU device"
+            )
+        num_slots = flat_host_k.shape[0]
+        if num_slots != flat_host_v.shape[0] or num_slots <= 0:
+            raise ValueError(
+                "Mooncake Host K/V pools have incompatible token capacities"
+            )
+
+        if capturing:
+            self.d2h_slot_mapping_cpu[:token_count].copy_(
+                slots,
+                non_blocking=True,
+            )
+            self.kv_offload_decode_cpp.enqueue_current_kv_index_copy_descriptors(
+                self.d2h_slot_mapping_cpu,
+                token_count,
+                self.max_d2h_index_copy_tokens,
+                num_slots,
+                self.d2h_src_idx_cpu,
+                self.d2h_dst_idx_cpu,
+                self.d2h_index_count_cpu,
+            )
+            self.d2h_src_idx_npu.copy_(
+                self.d2h_src_idx_cpu,
+                non_blocking=True,
+            )
+            self.d2h_dst_idx_npu.copy_(
+                self.d2h_dst_idx_cpu,
+                non_blocking=True,
+            )
+            self.d2h_index_count_npu.copy_(
+                self.d2h_index_count_cpu,
+                non_blocking=True,
+            )
+            flat_host_k.index_copy_(
+                0,
+                self.d2h_dst_idx_npu,
+                k_rows.index_select(0, self.d2h_src_idx_npu),
+            )
+            flat_host_v.index_copy_(
+                0,
+                self.d2h_dst_idx_npu,
+                v_rows.index_select(0, self.d2h_src_idx_npu),
+            )
+            return
+
+        valid = (slots >= 0) & (slots < num_slots)
+        valid_indices = torch.nonzero(valid, as_tuple=False).reshape(-1)
+        if valid_indices.numel() == 0:
+            return
+        destinations = slots.index_select(0, valid_indices)
+        flat_host_k.index_copy_(
+            0,
+            destinations,
+            k_rows.index_select(0, valid_indices),
+        )
+        flat_host_v.index_copy_(
+            0,
+            destinations,
+            v_rows.index_select(0, valid_indices),
+        )
 
     def onload_topk_kv(
         self,
@@ -1590,6 +1743,7 @@ class KVOffloadDecodeManager:
             self.use_fused_overlap
             and capturing
             and self.tp_rank == 0
+            and not self.d2h_index_copy_bypass
         ):
             torch_npu.npu.current_stream().wait_stream(self.current_kv_save_stream)
 

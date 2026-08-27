@@ -33,6 +33,14 @@ MULTI_CONNECTOR_PATH = (
     / "kv_transfer"
     / "ascend_multi_connector.py"
 )
+CPP_PATH = (
+    ROOT
+    / "vllm_ascend"
+    / "distributed"
+    / "kv_transfer"
+    / "kv_offload_decode"
+    / "kv_offload_decode.cpp"
+)
 
 
 def _function_source(path: Path, function_name: str) -> str:
@@ -104,6 +112,34 @@ class TestDSAHostPoolWiring(unittest.TestCase):
             mooncake_branch,
         )
         self.assertNotIn("broadcast(", mooncake_branch)
+
+    def test_mooncake_current_kv_index_copy_is_captured_on_main_stream(self):
+        init_source = _function_source(MANAGER_PATH, "__init__")
+        offload_source = _function_source(MANAGER_PATH, "offload_new_kv")
+        copy_source = _function_source(
+            MANAGER_PATH,
+            "_offload_new_kv_via_index_copy",
+        )
+        cpp_source = CPP_PATH.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "self.d2h_index_copy_bypass = self.uses_mooncake_host",
+            init_source,
+        )
+        self.assertIn("and not self.d2h_index_copy_bypass", offload_source)
+        self.assertIn(
+            "enqueue_current_kv_index_copy_descriptors",
+            copy_source,
+        )
+        self.assertIn("self.d2h_src_idx_npu.copy_", copy_source)
+        self.assertIn("self.d2h_dst_idx_npu.copy_", copy_source)
+        self.assertIn("flat_host_k.index_copy_", copy_source)
+        self.assertIn("flat_host_v.index_copy_", copy_source)
+        self.assertIn("aclrtLaunchHostFunc", cpp_source)
+        self.assertIn(
+            "current_kv_index_copy_descriptor_callback",
+            cpp_source,
+        )
 
     def test_manager_requires_matching_pool_topology(self):
         source = _function_source(

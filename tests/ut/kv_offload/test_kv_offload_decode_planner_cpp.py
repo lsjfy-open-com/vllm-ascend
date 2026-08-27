@@ -310,3 +310,26 @@ def test_enqueued_planner_callback_survives_graph_replays(planner_helper):
     finally:
         graph.reset()
         torch_npu.npu.synchronize()
+
+
+def test_current_kv_index_copy_descriptors_pad_last_valid(planner_helper):
+    slot_mapping = torch.tensor([7, -1, 3, 99], dtype=torch.int64)
+    max_num_tokens = 6
+    src_idx = torch.full((max_num_tokens,), -1, dtype=torch.int64)
+    dst_idx = torch.full((max_num_tokens,), -1, dtype=torch.int64)
+    count = torch.zeros(1, dtype=torch.int32)
+
+    result = planner_helper.compute_current_kv_index_copy_descriptors(
+        slot_mapping,
+        4,
+        max_num_tokens,
+        16,
+        src_idx,
+        dst_idx,
+        count,
+    )
+
+    assert result == 2
+    assert count.tolist() == [2]
+    assert src_idx.tolist() == [0, 2, 2, 2, 2, 2]
+    assert dst_idx.tolist() == [7, 3, 3, 3, 3, 3]

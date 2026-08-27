@@ -188,12 +188,27 @@ def test_mooncake_membership_uses_shared_operator_and_private_planner_storage():
             dtype=torch.int16,
         )
     )
+    synchronization_order = []
+    manager.tp_group.barrier.side_effect = (
+        lambda: synchronization_order.append("barrier")
+    )
+    current_stream = MagicMock()
+    current_stream.synchronize.side_effect = (
+        lambda: synchronization_order.append("stream_sync")
+    )
 
-    with patch.object(
-        manager_module,
-        "allocate_mooncake_host_region",
-        return_value=region,
-    ) as allocate:
+    with (
+        patch.object(
+            manager_module,
+            "allocate_mooncake_host_region",
+            return_value=region,
+        ) as allocate,
+        patch.object(
+            manager_module.torch_npu.npu,
+            "current_stream",
+            return_value=current_stream,
+        ),
+    ):
         membership = manager.allocate_fused_overlap_membership_map(3)
 
     planner = manager.fused_overlap_planner_membership_map
@@ -201,7 +216,9 @@ def test_mooncake_membership_uses_shared_operator_and_private_planner_storage():
     assert membership.shape == planner.shape
     assert membership.data_ptr() != planner.data_ptr()
     allocate.assert_called_once()
+    current_stream.synchronize.assert_called_once_with()
     manager.tp_group.barrier.assert_called_once_with()
+    assert synchronization_order == ["stream_sync", "barrier"]
 
 
 def test_eager_external_plan_bridges_private_planner_storage():

@@ -176,6 +176,11 @@ class TestDSAHostPoolWiring(unittest.TestCase):
         )
         self.assertIn("device=\"cpu\"", source)
         self.assertIn("pin_memory=True", source)
+        sync_pos = source.index(
+            "torch_npu.npu.current_stream().synchronize()"
+        )
+        barrier_pos = source.index("self.tp_group.barrier()", sync_pos)
+        self.assertLess(sync_pos, barrier_pos)
 
     def test_external_plan_publishes_planner_output(self):
         source = _function_source(

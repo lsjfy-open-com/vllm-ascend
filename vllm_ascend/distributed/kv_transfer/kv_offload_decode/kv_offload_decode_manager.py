@@ -599,6 +599,7 @@ class KVOffloadDecodeManager:
                 )
                 self._init_fused_overlap_membership_control(planner_map)
                 self._init_fused_overlap_membership_control(membership_map)
+                torch_npu.npu.current_stream().synchronize()
             self.tp_group.barrier()
             self.fused_overlap_membership_region = region
             self.fused_overlap_planner_membership_map = planner_map

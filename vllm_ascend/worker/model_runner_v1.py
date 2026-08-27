@@ -4368,6 +4368,8 @@ class NPUModelRunner(GPUModelRunner):
             if callable(parent_shutdown):
                 parent_shutdown()
         finally:
+            if self.kv_offload_decode_manager is not None:
+                self.kv_offload_decode_manager.close()
             if self.dsa_host_kv_pool is not None:
                 self.dsa_host_kv_pool.close()
                 self.dsa_host_kv_pool = None

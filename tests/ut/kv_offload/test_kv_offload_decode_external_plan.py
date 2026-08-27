@@ -12,6 +12,10 @@ pytest.importorskip("memfabric_hybrid")
 from vllm_ascend.distributed.kv_transfer.kv_offload_decode import (  # noqa: E402
     kv_offload_decode_manager as manager_module,
 )
+from vllm_ascend.distributed.kv_transfer.kv_offload_decode.host_backend import (  # noqa: E402
+    SFA_KV_OFFLOAD_BACKEND_MEMFABRIC,
+    SFA_KV_OFFLOAD_BACKEND_MOONCAKE,
+)
 from vllm_ascend.distributed.kv_transfer.kv_offload_decode.kv_offload_decode_manager import (  # noqa: E402
     FSA_EXTERNAL_PLAN_READY_MARKER,
     FSA_PAIRED_SELECTION_COPY_MARKER,
@@ -51,6 +55,9 @@ def _make_plan_manager():
     manager.current_kv_by_layer = {}
     manager.fused_overlap_membership_map = None
     manager.fused_overlap_membership_map_rows = 0
+    manager.fused_overlap_membership_region = None
+    manager.fused_overlap_planner_membership_map = None
+    manager.sfa_kv_offload_backend = SFA_KV_OFFLOAD_BACKEND_MEMFABRIC
     manager.fused_overlap_plan_owner_layer_id = None
     manager.fused_overlap_plan_topk = None
     manager.fused_overlap_plan_num_tokens = 0
@@ -125,6 +132,9 @@ def test_mapped_membership_allocation_initializes_external_plan_control():
     manager.topk = 2048
     manager.tp_rank = 0
     manager.tp_group = MagicMock()
+    manager.sfa_kv_offload_backend = SFA_KV_OFFLOAD_BACKEND_MEMFABRIC
+    manager.fused_overlap_membership_region = None
+    manager.fused_overlap_planner_membership_map = None
     real_zeros = torch.zeros
 
     def cpu_zeros(*args, **kwargs):
@@ -157,6 +167,82 @@ def test_mapped_membership_allocation_initializes_external_plan_control():
     assert control[:, 7].tolist() == [FSA_PAIRED_SELECTION_COPY_MARKER] * 3
     manager.tp_group.broadcast.assert_called_once()
     manager.tp_group.barrier.assert_called_once_with()
+
+
+def test_mooncake_membership_uses_shared_operator_and_private_planner_storage():
+    manager = KVOffloadDecodeManager.__new__(KVOffloadDecodeManager)
+    manager.use_fused_overlap = True
+    manager.topk = 2048
+    manager.tp_rank = 0
+    manager.tp_group = MagicMock()
+    manager.sfa_kv_offload_backend = SFA_KV_OFFLOAD_BACKEND_MOONCAKE
+    manager.runner_host_pool = SimpleNamespace(topology=SimpleNamespace())
+    manager.fused_overlap_membership_map = None
+    manager.fused_overlap_membership_map_rows = 0
+    manager.fused_overlap_membership_region = None
+    manager.fused_overlap_planner_membership_map = None
+    region = SimpleNamespace(
+        tensor=torch.empty(
+            3 * FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT,
+            dtype=torch.int16,
+        )
+    )
+
+    with patch.object(
+        manager_module,
+        "allocate_mooncake_host_region",
+        return_value=region,
+    ) as allocate:
+        membership = manager.allocate_fused_overlap_membership_map(3)
+
+    planner = manager.fused_overlap_planner_membership_map
+    assert planner is not None
+    assert membership.shape == planner.shape
+    assert membership.data_ptr() != planner.data_ptr()
+    allocate.assert_called_once()
+    manager.tp_group.barrier.assert_called_once_with()
+
+
+def test_eager_external_plan_bridges_private_planner_storage():
+    manager = _make_plan_manager()
+    manager.sfa_kv_offload_backend = SFA_KV_OFFLOAD_BACKEND_MOONCAKE
+    membership = torch.full(
+        (4, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT),
+        -1,
+        dtype=torch.int16,
+    )
+    planner_membership = torch.full_like(membership, 7)
+    manager.fused_overlap_membership_map = membership
+    manager.fused_overlap_planner_membership_map = planner_membership
+
+    assert manager.prepare_fused_overlap_external_plan(
+        layer_name="layer.0",
+        num_tokens=2,
+        topk_indices_npu=torch.tensor(
+            [[1, 2, 3, 4], [4, 3, 2, 1]],
+            dtype=torch.int32,
+        ),
+        req_ids_npu=torch.tensor([101, 202], dtype=torch.int64),
+        stable_prefix_lens_npu=torch.tensor([10, 20], dtype=torch.int32),
+        visible_seq_lens_npu=torch.tensor([11, 21], dtype=torch.int32),
+        selection_membership_map=membership,
+        capturing=False,
+    )
+
+    plan_start = (
+        FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT - manager.topk
+    )
+    torch.testing.assert_close(
+        membership[:2, plan_start:],
+        planner_membership[:2, plan_start:],
+    )
+    planner = (
+        manager.kv_offload_decode_cpp
+        .lru_resident_compact_with_plan_stable_rows
+    )
+    assert planner.call_args.args[17] == (
+        planner_membership[:2, plan_start:].data_ptr()
+    )
 
 
 def test_external_lru_plan_is_reused_by_three_skip_layers_and_replanned_at_owner():
@@ -318,7 +404,8 @@ def test_capture_external_plan_and_current_kv_use_separate_side_streams():
     manager.fused_plan_stream.wait_event.assert_called_once_with(input_event)
     manager.kv_offload_decode_cpp.enqueue_lru_resident_compact_with_plan_stable_rows.assert_called_once()
     manager.tp_group.broadcast.assert_called_once_with(manager.fused_plan_metadata_npu, src=0)
-    current_stream.wait_stream.assert_called_once_with(manager.current_kv_save_stream)
+    current_stream.wait_stream.assert_any_call(manager.fused_plan_stream)
+    current_stream.wait_stream.assert_any_call(manager.current_kv_save_stream)
     assert manager.current_kv_by_layer[0][0].numel() == 1
     assert manager.current_kv_by_layer[0][1].numel() == 1
 

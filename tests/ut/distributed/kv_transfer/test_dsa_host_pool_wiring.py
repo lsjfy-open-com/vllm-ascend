@@ -99,6 +99,32 @@ class TestDSAHostPoolWiring(unittest.TestCase):
         self.assertIn("pool.topology.tp_size != self.tp_size", source)
         self.assertIn("pool.layout.block_size != self.block_size", source)
 
+    def test_mooncake_membership_has_operator_and_planner_storage(self):
+        source = _function_source(
+            MANAGER_PATH,
+            "allocate_fused_overlap_membership_map",
+        )
+        self.assertIn("allocate_mooncake_host_region", source)
+        self.assertIn(
+            "self.fused_overlap_planner_membership_map = planner_map",
+            source,
+        )
+        self.assertIn("device=\"cpu\"", source)
+        self.assertIn("pin_memory=True", source)
+
+    def test_external_plan_publishes_planner_output(self):
+        source = _function_source(
+            MANAGER_PATH,
+            "prepare_fused_overlap_external_plan",
+        )
+        self.assertIn("planner_storage.data_ptr()", source)
+        self.assertIn("plan_storage.copy_", source)
+        self.assertIn("publish_plan(non_blocking=True)", source)
+        self.assertIn(
+            "current_stream().wait_stream",
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

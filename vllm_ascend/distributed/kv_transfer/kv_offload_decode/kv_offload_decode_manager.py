@@ -27,7 +27,9 @@ from vllm_ascend.distributed.kv_transfer.kv_offload_decode.host_backend import (
     resolve_sfa_kv_offload_backend,
 )
 from vllm_ascend.distributed.kv_transfer.kv_offload_decode.host_pool import (
+    DSAHostMemoryRegion,
     DSAHostKVPool,
+    allocate_mooncake_host_region,
 )
 
 
@@ -290,6 +292,8 @@ class KVOffloadDecodeManager:
         )
         self.fused_overlap_membership_map: torch.Tensor | None = None
         self.fused_overlap_membership_map_rows = 0
+        self.fused_overlap_membership_region: DSAHostMemoryRegion | None = None
+        self.fused_overlap_planner_membership_map: torch.Tensor | None = None
         self.fused_overlap_plan_owner_layer_id: int | None = None
         self.fused_overlap_plan_topk: int | None = None
         self.fused_overlap_plan_num_tokens = 0
@@ -567,38 +571,92 @@ class KVOffloadDecodeManager:
             return self.fused_overlap_membership_map
 
         shape = [row_capacity, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT]
-        owner_ptr = torch.zeros(1, dtype=torch.int64, device="npu")
-        membership_map = None
-        if self.tp_rank == 0:
-            membership_map = offload.empty(
-                [row_capacity * FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT],
+        if self.uses_mooncake_host:
+            if self.runner_host_pool is None:
+                raise RuntimeError(
+                    "Mooncake membership allocation requires the runner Host pool"
+                )
+            region = allocate_mooncake_host_region(
+                numel=(
+                    row_capacity
+                    * FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT
+                ),
                 dtype=torch.int16,
-                pin_memory=True,
-            ).view(shape)
-            membership_map.fill_(-1)
-            control = membership_map[
-                :,
-                FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT:
-                FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT
-                + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT,
-            ]
-            control[:, 1] = FSA_EXTERNAL_PLAN_READY_MARKER
-            control[:, 2] = self.topk
-            control[:, 3] = (
-                FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT - self.topk
+                alignment=self._CPU_CACHE_ALIGNMENT,
+                name="dsa_fused_membership",
+                topology=self.runner_host_pool.topology,
             )
-            control[:, 7] = FSA_PAIRED_SELECTION_COPY_MARKER
-            owner_ptr[0] = membership_map.data_ptr()
-        self.tp_group.broadcast(owner_ptr, src=0)
-        shared_ptr = int(owner_ptr.item())
-        if self.tp_rank != 0:
-            membership_map = self._restore_int16_tensor(shared_ptr, shape)
-        if membership_map is None:
-            raise RuntimeError("mapped membership storage was not initialized")
-        self.tp_group.barrier()
+            membership_map = region.tensor.view(shape)
+            planner_map = None
+            if self.tp_rank == 0:
+                planner_map = torch.empty(
+                    shape,
+                    dtype=torch.int16,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self._init_fused_overlap_membership_control(planner_map)
+                self._init_fused_overlap_membership_control(membership_map)
+            self.tp_group.barrier()
+            self.fused_overlap_membership_region = region
+            self.fused_overlap_planner_membership_map = planner_map
+        else:
+            owner_ptr = torch.zeros(1, dtype=torch.int64, device="npu")
+            membership_map = None
+            if self.tp_rank == 0:
+                membership_map = offload.empty(
+                    [
+                        row_capacity
+                        * FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT
+                    ],
+                    dtype=torch.int16,
+                    pin_memory=True,
+                ).view(shape)
+                self._init_fused_overlap_membership_control(membership_map)
+                owner_ptr[0] = membership_map.data_ptr()
+            self.tp_group.broadcast(owner_ptr, src=0)
+            shared_ptr = int(owner_ptr.item())
+            if self.tp_rank != 0:
+                membership_map = self._restore_int16_tensor(shared_ptr, shape)
+            if membership_map is None:
+                raise RuntimeError(
+                    "mapped membership storage was not initialized"
+                )
+            self.tp_group.barrier()
+            self.fused_overlap_planner_membership_map = membership_map
+
         self.fused_overlap_membership_map = membership_map
         self.fused_overlap_membership_map_rows = row_capacity
         return membership_map
+
+    def _init_fused_overlap_membership_control(
+        self,
+        membership_map: torch.Tensor,
+    ) -> None:
+        membership_map.fill_(-1)
+        control = membership_map[
+            :,
+            FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT:
+            FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT
+            + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT,
+        ]
+        control[:, 1] = FSA_EXTERNAL_PLAN_READY_MARKER
+        control[:, 2] = self.topk
+        control[:, 3] = (
+            FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT - self.topk
+        )
+        control[:, 7] = FSA_PAIRED_SELECTION_COPY_MARKER
+
+    def is_fused_membership_storage(self, tensor: torch.Tensor) -> bool:
+        if tensor.dtype != torch.int16:
+            return False
+        if self.uses_mooncake_host:
+            return (
+                self.fused_overlap_membership_map is not None
+                and tensor.data_ptr()
+                == self.fused_overlap_membership_map.data_ptr()
+            )
+        return tensor.device.type == "cpu"
 
     def get_fused_overlap_cpu_kv_inputs(
         self,
@@ -1333,10 +1391,12 @@ class KVOffloadDecodeManager:
             or selection_membership_map.shape[0] < num_tokens
             or selection_membership_map.shape[1] < required_columns
             or selection_membership_map.dtype != torch.int16
-            or selection_membership_map.device.type != "cpu"
+            or not self.is_fused_membership_storage(
+                selection_membership_map
+            )
         ):
             raise ValueError(
-                "external FSA plan requires mapped CPU int16 membership storage: "
+                "external FSA plan requires registered int16 membership storage: "
                 f"min_shape=({num_tokens}, {required_columns}), "
                 f"actual_shape={tuple(selection_membership_map.shape)}, "
                 f"dtype={selection_membership_map.dtype}, "
@@ -1349,7 +1409,22 @@ class KVOffloadDecodeManager:
             :num_tokens,
             plan_start:required_columns,
         ]
-        encoded_plan_stride = selection_membership_map.stride(0)
+        planner_membership_map = self.fused_overlap_planner_membership_map
+        if planner_membership_map is None:
+            planner_membership_map = selection_membership_map
+        planner_storage = planner_membership_map[
+            :num_tokens,
+            plan_start:required_columns,
+        ]
+        encoded_plan_stride = planner_membership_map.stride(0)
+
+        def publish_plan(non_blocking: bool) -> None:
+            if planner_storage.data_ptr() == plan_storage.data_ptr():
+                return
+            plan_storage.copy_(
+                planner_storage,
+                non_blocking=non_blocking,
+            )
 
         owner_layer_id = self.fused_overlap_plan_owner_layer_id
         can_reuse_owner_plan = (
@@ -1397,7 +1472,7 @@ class KVOffloadDecodeManager:
                 self.lru_epochs_ptr,
                 self.lru_physical_row_workspace_ptr,
                 self.max_num_topk_rows,
-                plan_storage.data_ptr(),
+                planner_storage.data_ptr(),
                 encoded_plan_stride,
                 num_tokens,
                 self.topk,
@@ -1433,7 +1508,11 @@ class KVOffloadDecodeManager:
                         ],
                         non_blocking=True,
                     )
+                    publish_plan(non_blocking=True)
                 self.tp_group.broadcast(self.fused_plan_metadata_npu, src=0)
+            torch_npu.npu.current_stream().wait_stream(
+                self.fused_plan_stream
+            )
             self.fused_overlap_plan_owner_layer_id = layer_id
             self.fused_overlap_plan_topk = self.topk
             self.fused_overlap_plan_num_tokens = num_tokens
@@ -1459,6 +1538,7 @@ class KVOffloadDecodeManager:
                         self.max_num_topk_rows * 2 + num_tokens
                     ]
                 )
+                publish_plan(non_blocking=False)
             except Exception as exc:
                 planner_error = exc
                 self.fused_plan_status_npu.fill_(1)
@@ -1595,6 +1675,13 @@ class KVOffloadDecodeManager:
             size_buffer,
             num_tokens_buffer,
         )
+
+    def close(self) -> None:
+        if self.fused_overlap_membership_region is not None:
+            self.fused_overlap_membership_region.release()
+            self.fused_overlap_membership_region = None
+        self.fused_overlap_membership_map = None
+        self.fused_overlap_planner_membership_map = None
 
 
 _KV_OFFLOAD_DECODE_MANAGER: KVOffloadDecodeManager = None

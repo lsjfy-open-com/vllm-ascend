@@ -57,15 +57,29 @@ def _function_source(path: Path, function_name: str) -> str:
 
 class TestDSAHostPoolWiring(unittest.TestCase):
 
-    def test_runner_allocates_pool_before_manager_registration(self):
-        source = _function_source(RUNNER_PATH, "initialize_kv_cache")
+    def test_runner_allocates_pool_before_cache_binding(self):
+        source = _function_source(
+            RUNNER_PATH,
+            "initialize_kv_cache_tensors",
+        )
         allocate_pos = source.index(
             "self._allocate_fused_overlap_host_main"
         )
+        bind_pos = source.index(
+            "if self.model_config.hf_text_config.model_type == "
+            '"deepseek_v4"'
+        )
+        self.assertLess(allocate_pos, bind_pos)
+
+    def test_runner_registers_allocated_pool_after_cache_binding(self):
+        source = _function_source(RUNNER_PATH, "initialize_kv_cache")
+        cache_pos = source.index("self.initialize_kv_cache_tensors")
+        pool_pos = source.index("runner_host_pool = self.dsa_host_kv_pool")
         register_pos = source.index(
             "self.kv_offload_decode_manager.register_kv_caches"
         )
-        self.assertLess(allocate_pos, register_pos)
+        self.assertLess(cache_pos, pool_pos)
+        self.assertLess(pool_pos, register_pos)
         self.assertIn("connector.bind_runner_host_pool", source)
 
     def test_runner_binds_pool_views_into_six_tuple(self):

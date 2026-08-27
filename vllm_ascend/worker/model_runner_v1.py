@@ -4234,10 +4234,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.kv_offload_decode_config,
             )
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
-        runner_host_pool = self._allocate_fused_overlap_host_main(
-            kv_cache_config,
-            kv_caches,
-        )
+        runner_host_pool = self.dsa_host_kv_pool
         # TODO: refactor the logic of attention
         if (
             self.speculative_config
@@ -4399,6 +4396,11 @@ class NPUModelRunner(GPUModelRunner):
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
+
+        self._allocate_fused_overlap_host_main(
+            kv_cache_config,
+            kv_caches,
+        )
 
         if self.model_config.hf_text_config.model_type == "deepseek_v4":
             from vllm_ascend.utils import extract_dsv4_layer_index

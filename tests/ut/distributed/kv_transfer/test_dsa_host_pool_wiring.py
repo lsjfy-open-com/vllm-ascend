@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Dependency-free wiring contracts for the runner-owned DSA Host pool."""
+
+from __future__ import annotations
+
+import ast
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).parents[4]
+RUNNER_PATH = ROOT / "vllm_ascend" / "worker" / "model_runner_v1.py"
+MANAGER_PATH = (
+    ROOT
+    / "vllm_ascend"
+    / "distributed"
+    / "kv_transfer"
+    / "kv_offload_decode"
+    / "kv_offload_decode_manager.py"
+)
+
+
+def _function_source(path: Path, function_name: str) -> str:
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == function_name:
+                segment = ast.get_source_segment(source, node)
+                assert segment is not None
+                return segment
+    raise AssertionError(f"function {function_name!r} not found in {path}")
+
+
+class TestDSAHostPoolWiring(unittest.TestCase):
+
+    def test_runner_allocates_pool_before_manager_registration(self):
+        source = _function_source(RUNNER_PATH, "initialize_kv_cache")
+        allocate_pos = source.index(
+            "self._allocate_fused_overlap_host_main"
+        )
+        register_pos = source.index(
+            "self.kv_offload_decode_manager.register_kv_caches"
+        )
+        self.assertLess(allocate_pos, register_pos)
+        self.assertIn("connector.bind_runner_host_pool", source)
+
+    def test_runner_binds_pool_views_into_six_tuple(self):
+        source = _function_source(
+            RUNNER_PATH,
+            "_allocate_fused_overlap_host_main",
+        )
+        self.assertIn("DSAHostKVPool.allocate", source)
+        self.assertIn("manager.bind_runner_host_pool(pool)", source)
+        self.assertIn("pool.k_caches[layer_id]", source)
+        self.assertIn("pool.v_caches[layer_id]", source)
+        self.assertIn("owner_rank=0", source)
+
+    def test_runner_skips_per_layer_host_alloc_for_mooncake(self):
+        source = _function_source(
+            RUNNER_PATH,
+            "_allocate_kv_cache_tensors_for_kv_offload_decode",
+        )
+        self.assertIn(
+            "not self.kv_offload_decode_manager.uses_mooncake_host",
+            source,
+        )
+
+    def test_manager_selects_backend_from_connector_config(self):
+        source = _function_source(MANAGER_PATH, "__init__")
+        self.assertIn("resolve_sfa_kv_offload_backend", source)
+        self.assertIn("kv_transfer_extra_config(vllm_config)", source)
+        mooncake_pos = source.index("if self.uses_mooncake_host")
+        initialize_pos = source.index("offload.initialize(config)")
+        self.assertLess(mooncake_pos, initialize_pos)
+
+    def test_manager_uses_each_rank_local_shared_segment_address(self):
+        source = _function_source(MANAGER_PATH, "register_kv_caches")
+        mooncake_branch = source.split(
+            "if self.uses_mooncake_host:",
+            maxsplit=2,
+        )[2].split("else:", maxsplit=1)[0]
+        self.assertIn(
+            "self.gvas_k_bases.append(k_cpu.data_ptr())",
+            mooncake_branch,
+        )
+        self.assertIn(
+            "self.gvas_v_bases.append(v_cpu.data_ptr())",
+            mooncake_branch,
+        )
+        self.assertNotIn("broadcast(", mooncake_branch)
+
+    def test_manager_requires_matching_pool_topology(self):
+        source = _function_source(
+            MANAGER_PATH,
+            "bind_runner_host_pool",
+        )
+        self.assertIn("pool.topology.tp_rank != self.tp_rank", source)
+        self.assertIn("pool.topology.tp_size != self.tp_size", source)
+        self.assertIn("pool.layout.block_size != self.block_size", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

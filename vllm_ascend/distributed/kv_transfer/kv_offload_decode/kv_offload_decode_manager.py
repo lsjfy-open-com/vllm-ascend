@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -20,6 +21,14 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.ascend_config import KVOffloadDecodeConfig
+from vllm_ascend.distributed.kv_transfer.kv_offload_decode.host_backend import (
+    SFA_KV_OFFLOAD_BACKEND_MOONCAKE,
+    kv_transfer_extra_config,
+    resolve_sfa_kv_offload_backend,
+)
+from vllm_ascend.distributed.kv_transfer.kv_offload_decode.host_pool import (
+    DSAHostKVPool,
+)
 
 
 # Main BF16 cache: [k_cache, v_cache, k_cache_cpu, v_cache_cpu,
@@ -263,6 +272,11 @@ class KVOffloadDecodeManager:
         self.topk_buffer_size = kv_offload_decode_config.topk_buffer_size
         self.topk = kv_offload_decode_config.topk
         self.use_fused_overlap = bool(getattr(kv_offload_decode_config, "use_fused_overlap", False))
+        self.sfa_kv_offload_backend = resolve_sfa_kv_offload_backend(
+            kv_transfer_extra_config(vllm_config),
+            use_fused_overlap_offload=self.use_fused_overlap,
+        )
+        self.runner_host_pool: DSAHostKVPool | None = None
 
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -312,20 +326,70 @@ class KVOffloadDecodeManager:
                 f"num_blocks={kv_cache_config.num_blocks}"
             )
         actual_pool_size_bytes = min(planned_pool_size_bytes, dram_limit_bytes)
-        logger.info(
-            "KVOffloadDecodeManager starts CPU KV pool initialization: "
-            "planned=%.2f GiB, configured_limit=%s GiB, num_blocks=%s.",
-            actual_pool_size_bytes / (1 << 30),
-            kv_offload_decode_config.dram_size_per_dp_GB,
-            kv_cache_config.num_blocks,
+        if self.uses_mooncake_host:
+            logger.info(
+                "KVOffloadDecodeManager selected Mooncake shared Host pool: "
+                "planned=%.2f GiB, configured_limit=%s GiB, num_blocks=%s, "
+                "tp=%s/%s.",
+                actual_pool_size_bytes / (1 << 30),
+                kv_offload_decode_config.dram_size_per_dp_GB,
+                kv_cache_config.num_blocks,
+                self.tp_rank,
+                self.tp_size,
+            )
+        else:
+            logger.info(
+                "KVOffloadDecodeManager starts MemFabric CPU KV pool "
+                "initialization: planned=%.2f GiB, configured_limit=%s GiB, "
+                "num_blocks=%s.",
+                actual_pool_size_bytes / (1 << 30),
+                kv_offload_decode_config.dram_size_per_dp_GB,
+                kv_cache_config.num_blocks,
+            )
+            config = offload.OffloadConfig()
+            config.device_id = torch_npu.npu.current_device()
+            config.size = actual_pool_size_bytes
+            config.world_size = self.tp_size
+            config.rank_id = self.tp_rank
+            offload.initialize(config)
+            self.tp_group.barrier()
+
+    @property
+    def uses_mooncake_host(self) -> bool:
+        return (
+            self.sfa_kv_offload_backend
+            == SFA_KV_OFFLOAD_BACKEND_MOONCAKE
         )
-        config = offload.OffloadConfig()
-        config.device_id = torch_npu.npu.current_device()
-        config.size = actual_pool_size_bytes
-        config.world_size = self.tp_size
-        config.rank_id = self.tp_rank
-        offload.initialize(config)
-        self.tp_group.barrier()
+
+    @staticmethod
+    def layer_sort_key(layer_name: str) -> tuple[int, str]:
+        match = re.search(r"layers\.(\d+)", layer_name)
+        return (
+            int(match.group(1)) if match is not None else 10**9,
+            layer_name,
+        )
+
+    def bind_runner_host_pool(self, pool: DSAHostKVPool) -> None:
+        if not self.uses_mooncake_host:
+            raise RuntimeError(
+                "runner-owned Host pool requires sfa_kv_offload_backend=mooncake"
+            )
+        if pool.topology.tp_rank != self.tp_rank:
+            raise ValueError(
+                "DSA Host pool TP rank mismatch: "
+                f"pool={pool.topology.tp_rank}, manager={self.tp_rank}"
+            )
+        if pool.topology.tp_size != self.tp_size:
+            raise ValueError(
+                "DSA Host pool TP size mismatch: "
+                f"pool={pool.topology.tp_size}, manager={self.tp_size}"
+            )
+        if pool.layout.block_size != self.block_size:
+            raise ValueError(
+                "DSA Host pool block size mismatch: "
+                f"pool={pool.layout.block_size}, manager={self.block_size}"
+            )
+        self.runner_host_pool = pool
 
     def _build_cpp(self):
         os.environ["TORCH_EXTENSIONS_ALWAYS_BUILD"] = "1"
@@ -398,6 +462,8 @@ class KVOffloadDecodeManager:
             layer_name for layer_name in kv_caches
             if 'indexer' not in layer_name
         ]
+        if self.uses_mooncake_host:
+            self.offload_layer_names.sort(key=self.layer_sort_key)
         if not self.offload_layer_names:
             raise ValueError("KV offload decode did not find SFA KV cache layers.")
 
@@ -562,6 +628,20 @@ class KVOffloadDecodeManager:
         kv_caches: dict[str, torch.Tensor],
     ):
         self._register_offload_layers(kv_caches)
+        if self.uses_mooncake_host:
+            if self.runner_host_pool is None:
+                raise RuntimeError(
+                    "Mooncake Host backend requires a runner-owned DSA Host pool"
+                )
+            if self.runner_host_pool.layout.layer_names != tuple(
+                self.offload_layer_names
+            ):
+                raise ValueError(
+                    "DSA Host pool layer order does not match registered "
+                    "offload layers: "
+                    f"pool={self.runner_host_pool.layout.layer_names}, "
+                    f"registered={tuple(self.offload_layer_names)}"
+                )
 
         # register topk_buffer and cpu kv_cache
         self.topk_buffers_k: list[torch.Tensor] = []
@@ -578,7 +658,7 @@ class KVOffloadDecodeManager:
                 )
             self.topk_buffers_k.append(cache_or_caches[OFFLOAD_TOPK_BUFFER_K_INDEX])
             self.topk_buffers_v.append(cache_or_caches[OFFLOAD_TOPK_BUFFER_V_INDEX])
-            if self.tp_rank == 0:
+            if self.uses_mooncake_host or self.tp_rank == 0:
                 self.k_caches_cpu.append(cache_or_caches[OFFLOAD_K_CACHE_CPU_INDEX])
                 self.v_caches_cpu.append(cache_or_caches[OFFLOAD_V_CACHE_CPU_INDEX])
 
@@ -661,61 +741,117 @@ class KVOffloadDecodeManager:
         self.gvas_k_bases: list[int] = []
         self.gvas_v_bases: list[int] = []
         self.cpu_block_lens: list[tuple[int, int]] = []
-        gvas_k_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
-        gvas_v_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
-        cpu_block_lens_tensor = torch.zeros([self.num_layers, 2], dtype=torch.int64, device='npu')
-        shape_k_tensor = torch.zeros([4], dtype=torch.int64, device='npu')
-        shape_v_tensor = torch.zeros([4], dtype=torch.int64, device='npu')
-        if self.tp_rank == 0:
+        if self.uses_mooncake_host:
             for layer_id in range(self.num_layers):
                 k_cpu = self.k_caches_cpu[layer_id]
                 v_cpu = self.v_caches_cpu[layer_id]
-                gvas_k_tensor[layer_id] = k_cpu.data_ptr()
-                gvas_v_tensor[layer_id] = v_cpu.data_ptr()
-                cpu_block_lens_tensor[layer_id, 0] = (
-                    k_cpu.numel() * k_cpu.element_size() // self.kv_cache_config.num_blocks
+                self.gvas_k_bases.append(k_cpu.data_ptr())
+                self.gvas_v_bases.append(v_cpu.data_ptr())
+                self.cpu_block_lens.append(
+                    (
+                        k_cpu.numel()
+                        * k_cpu.element_size()
+                        // self.kv_cache_config.num_blocks,
+                        v_cpu.numel()
+                        * v_cpu.element_size()
+                        // self.kv_cache_config.num_blocks,
+                    )
                 )
-                cpu_block_lens_tensor[layer_id, 1] = (
-                    v_cpu.numel() * v_cpu.element_size() // self.kv_cache_config.num_blocks
-                )
-            shape_k_tensor.copy_(
-                torch.tensor(self.k_caches_cpu[0].shape, dtype=torch.int64, device='npu')
-            )
-            shape_v_tensor.copy_(
-                torch.tensor(self.v_caches_cpu[0].shape, dtype=torch.int64, device='npu')
-            )
-        self.tp_group.broadcast(gvas_k_tensor, src=0)
-        self.tp_group.broadcast(gvas_v_tensor, src=0)
-        self.tp_group.broadcast(cpu_block_lens_tensor, src=0)
-        self.tp_group.broadcast(shape_k_tensor, src=0)
-        self.tp_group.broadcast(shape_v_tensor, src=0)
-        for layer_id in range(self.num_layers):
-            self.gvas_k_bases.append(gvas_k_tensor[layer_id].item())
-            self.gvas_v_bases.append(gvas_v_tensor[layer_id].item())
-            self.cpu_block_lens.append((
-                cpu_block_lens_tensor[layer_id, 0].item(),
-                cpu_block_lens_tensor[layer_id, 1].item(),
-            ))
-
-        if self.use_fused_overlap and self.tp_rank != 0:
-            cpu_k_shape = [int(x) for x in shape_k_tensor.tolist()]
-            cpu_v_shape = [int(x) for x in shape_v_tensor.tolist()]
-            self.k_caches_cpu = [
-                self._restore_bfloat16_tensor(ptr, cpu_k_shape)
-                for ptr in self.gvas_k_bases
-            ]
-            self.v_caches_cpu = [
-                self._restore_bfloat16_tensor(ptr, cpu_v_shape)
-                for ptr in self.gvas_v_bases
-            ]
             logger.info(
-                "[fused_overlap_offload][init] restored shared CPU KV views on "
-                "tp_rank=%s layer_count=%s k_shape=%s v_shape=%s",
+                "Registered local Mooncake shared Host views: tp=%s/%s "
+                "layers=%s pool_ptr=0x%x layout=%s",
                 self.tp_rank,
+                self.tp_size,
                 self.num_layers,
-                cpu_k_shape,
-                cpu_v_shape,
+                self.runner_host_pool.data_ptr,
+                self.runner_host_pool.layout.fingerprint,
             )
+        else:
+            gvas_k_tensor = torch.zeros(
+                [self.num_layers],
+                dtype=torch.int64,
+                device="npu",
+            )
+            gvas_v_tensor = torch.zeros(
+                [self.num_layers],
+                dtype=torch.int64,
+                device="npu",
+            )
+            cpu_block_lens_tensor = torch.zeros(
+                [self.num_layers, 2],
+                dtype=torch.int64,
+                device="npu",
+            )
+            shape_k_tensor = torch.zeros(
+                [4],
+                dtype=torch.int64,
+                device="npu",
+            )
+            shape_v_tensor = torch.zeros(
+                [4],
+                dtype=torch.int64,
+                device="npu",
+            )
+            if self.tp_rank == 0:
+                for layer_id in range(self.num_layers):
+                    k_cpu = self.k_caches_cpu[layer_id]
+                    v_cpu = self.v_caches_cpu[layer_id]
+                    gvas_k_tensor[layer_id] = k_cpu.data_ptr()
+                    gvas_v_tensor[layer_id] = v_cpu.data_ptr()
+                    cpu_block_lens_tensor[layer_id, 0] = (
+                        k_cpu.numel()
+                        * k_cpu.element_size()
+                        // self.kv_cache_config.num_blocks
+                    )
+                    cpu_block_lens_tensor[layer_id, 1] = (
+                        v_cpu.numel()
+                        * v_cpu.element_size()
+                        // self.kv_cache_config.num_blocks
+                    )
+                shape_k_tensor.copy_(
+                    torch.tensor(
+                        self.k_caches_cpu[0].shape,
+                        dtype=torch.int64,
+                        device="npu",
+                    )
+                )
+                shape_v_tensor.copy_(
+                    torch.tensor(
+                        self.v_caches_cpu[0].shape,
+                        dtype=torch.int64,
+                        device="npu",
+                    )
+                )
+            self.tp_group.broadcast(gvas_k_tensor, src=0)
+            self.tp_group.broadcast(gvas_v_tensor, src=0)
+            self.tp_group.broadcast(cpu_block_lens_tensor, src=0)
+            self.tp_group.broadcast(shape_k_tensor, src=0)
+            self.tp_group.broadcast(shape_v_tensor, src=0)
+            for layer_id in range(self.num_layers):
+                self.gvas_k_bases.append(gvas_k_tensor[layer_id].item())
+                self.gvas_v_bases.append(gvas_v_tensor[layer_id].item())
+                self.cpu_block_lens.append(
+                    (
+                        cpu_block_lens_tensor[layer_id, 0].item(),
+                        cpu_block_lens_tensor[layer_id, 1].item(),
+                    )
+                )
+
+            if self.use_fused_overlap and self.tp_rank != 0:
+                cpu_k_shape = [
+                    int(value) for value in shape_k_tensor.tolist()
+                ]
+                cpu_v_shape = [
+                    int(value) for value in shape_v_tensor.tolist()
+                ]
+                self.k_caches_cpu = [
+                    self._restore_bfloat16_tensor(ptr, cpu_k_shape)
+                    for ptr in self.gvas_k_bases
+                ]
+                self.v_caches_cpu = [
+                    self._restore_bfloat16_tensor(ptr, cpu_v_shape)
+                    for ptr in self.gvas_v_bases
+                ]
 
         gvas_buffer_offset = 0
         gvas_buffer_size_bytes = self.max_num_topk_rows * self.topk * 2 * 8 # 2: k+v, 8: int64

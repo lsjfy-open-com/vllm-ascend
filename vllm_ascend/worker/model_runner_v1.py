@@ -130,6 +130,9 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.distributed.kv_transfer.kv_offload_decode import (
+    host_pool as dsa_host_pool,
+)
 from vllm_ascend.distributed.kv_transfer.kv_offload_decode.kv_offload_decode_manager import init_kv_offload_decode_manager
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
     get_gva_layerwise_config,
@@ -592,6 +595,7 @@ class NPUModelRunner(GPUModelRunner):
         self.kv_offload_decode_config = self.ascend_config.kv_offload_decode_config
         self.kv_offload_decode_enabled = self.kv_offload_decode_config.enabled
         self.kv_offload_decode_manager = None
+        self.dsa_host_kv_pool: dsa_host_pool.DSAHostKVPool | None = None
         self.tp_rank = get_tensor_model_parallel_rank()
 
         # Per-request metadata consumed by the KV offload decode resident LRU.
@@ -4230,6 +4234,10 @@ class NPUModelRunner(GPUModelRunner):
                 self.kv_offload_decode_config,
             )
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        runner_host_pool = self._allocate_fused_overlap_host_main(
+            kv_cache_config,
+            kv_caches,
+        )
         # TODO: refactor the logic of attention
         if (
             self.speculative_config
@@ -4250,9 +4258,13 @@ class NPUModelRunner(GPUModelRunner):
         if self.kv_offload_decode_enabled:
             self.kv_offload_decode_manager.register_kv_caches(kv_caches)
         if has_kv_transfer_group():
-            # Decode-side PD connectors bind their destinations to the CPU KV
-            # pool allocated and registered by KVOffloadDecodeManager.
-            get_kv_transfer_group().register_kv_caches(kv_caches)
+            connector = get_kv_transfer_group()
+            if (
+                runner_host_pool is not None
+                and hasattr(connector, "bind_runner_host_pool")
+            ):
+                connector.bind_runner_host_pool(runner_host_pool)
+            connector.register_kv_caches(kv_caches)
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
@@ -4265,6 +4277,100 @@ class NPUModelRunner(GPUModelRunner):
             if isinstance(module, AscendMoERunner):
                 module._ascend_routed_experts_capturer = capturer
                 module.routed_experts._ascend_routed_experts_capturer = capturer
+
+    def _use_fused_overlap_runner_host_alloc(self) -> bool:
+        manager = self.kv_offload_decode_manager
+        return bool(
+            self.kv_offload_decode_enabled
+            and manager is not None
+            and manager.use_fused_overlap
+            and manager.uses_mooncake_host
+        )
+
+    def _allocate_fused_overlap_host_main(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_caches: dict[str, torch.Tensor],
+    ) -> dsa_host_pool.DSAHostKVPool | None:
+        """Allocate and bind the Mooncake shared Host pool."""
+        if not self._use_fused_overlap_runner_host_alloc():
+            return None
+
+        manager = self.kv_offload_decode_manager
+        offload_names = sorted(
+            (
+                name
+                for name, cache in kv_caches.items()
+                if "indexer" not in name
+                and isinstance(cache, (list, tuple))
+                and len(cache) == 6
+            ),
+            key=manager.layer_sort_key,
+        )
+        if not offload_names:
+            raise RuntimeError(
+                "Mooncake DSA Host pool found no KV offload layers"
+            )
+
+        sample = kv_caches[offload_names[0]]
+        k_width = int(sample[4].shape[-1])
+        v_width = int(sample[5].shape[-1])
+        layout = dsa_host_pool.DSAHostKVPoolLayout(
+            layer_names=tuple(offload_names),
+            num_blocks=int(kv_cache_config.num_blocks),
+            block_size=int(manager.block_size),
+            k_width=k_width,
+            v_width=v_width,
+        )
+        topology = dsa_host_pool.DSAHostPoolTopology(
+            tp_rank=get_tensor_model_parallel_rank(),
+            tp_size=get_tensor_model_parallel_world_size(),
+            owner_rank=0,
+            device_id=int(getattr(self.device, "index", 0) or 0),
+            dp_rank=int(self.dp_rank),
+            tp_group=get_tp_group(),
+        )
+        pool = dsa_host_pool.DSAHostKVPool.allocate(
+            layout,
+            topology=topology,
+        )
+        manager.bind_runner_host_pool(pool)
+        for layer_id, layer_name in enumerate(offload_names):
+            cache = tuple(kv_caches[layer_name])
+            kv_caches[layer_name] = (
+                cache[0],
+                cache[1],
+                pool.k_caches[layer_id],
+                pool.v_caches[layer_id],
+                cache[4],
+                cache[5],
+            )
+
+        self.dsa_host_kv_pool = pool
+        logger.info(
+            "Allocated Mooncake DSA Host pool: layers=%s k_shape=%s "
+            "v_shape=%s ptr=0x%x bytes=%s layout=%s tp=%s/%s owner=%s",
+            layout.num_layers,
+            layout.k_shape,
+            layout.v_shape,
+            pool.data_ptr,
+            pool.nbytes,
+            layout.fingerprint,
+            topology.tp_rank,
+            topology.tp_size,
+            topology.owner_rank,
+        )
+        return pool
+
+    def shutdown(self) -> None:
+        parent_shutdown = getattr(super(), "shutdown", None)
+        try:
+            if callable(parent_shutdown):
+                parent_shutdown()
+        finally:
+            if self.dsa_host_kv_pool is not None:
+                self.dsa_host_kv_pool.close()
+                self.dsa_host_kv_pool = None
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()
@@ -5512,7 +5618,10 @@ class NPUModelRunner(GPUModelRunner):
         v_tensor_size: int,
         alignment: int,
     ) -> tuple[torch.Tensor | int]:
-        if self.tp_rank == 0:
+        if (
+            self.tp_rank == 0
+            and not self.kv_offload_decode_manager.uses_mooncake_host
+        ):
             [k_tensor_cpu, v_tensor_cpu] = self.kv_offload_decode_manager.empty_aligned_int8_cpu_tensors(
                 [k_tensor_size, v_tensor_size],
                 alignment,
@@ -5571,7 +5680,7 @@ class NPUModelRunner(GPUModelRunner):
         k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape) if raw_k_tensor is not None else None
         v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape) if raw_v_tensor is not None else None
 
-        if self.tp_rank == 0:
+        if raw_k_tensor_cpu is not None and raw_v_tensor_cpu is not None:
             k_cache_cpu = raw_k_tensor_cpu.view(k_cache_dtype).view(k_shape)
             v_cache_cpu = raw_v_tensor_cpu.view(v_cache_dtype).view(v_shape)
         else:

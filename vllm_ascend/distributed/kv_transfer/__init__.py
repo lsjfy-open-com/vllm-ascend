@@ -91,3 +91,15 @@ def register_connector():
         "vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.connector",
         "SFAPDCpuOffloadConnector",
     )
+
+    KVConnectorFactory.register_connector(
+        "MooncakeLayerwiseToDramConnector",
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_to_dram_connector",
+        "MooncakeLayerwiseToDramConnector",
+    )
+
+    KVConnectorFactory.register_connector(
+        "MooncakeLayerwiseD2RHConnector",
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_to_dram_connector",
+        "MooncakeLayerwiseD2RHConnector",
+    )

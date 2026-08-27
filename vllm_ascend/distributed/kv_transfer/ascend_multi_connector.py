@@ -79,6 +79,18 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                     f"{provider.__class__.__name__} registered {provider_count}"
                 )
 
+    def bind_runner_host_pool(self, pool: Any) -> None:
+        bound = False
+        for connector in self._connectors:
+            bind_pool = getattr(connector, "bind_runner_host_pool", None)
+            if callable(bind_pool):
+                bind_pool(pool)
+                bound = True
+        if not bound:
+            raise RuntimeError(
+                "Mooncake DSA Host pool has no connector consumer"
+            )
+
     def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         for connector in self._connectors:
             connector.register_kv_caches(kv_caches)

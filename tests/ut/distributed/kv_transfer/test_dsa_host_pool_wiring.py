@@ -18,6 +18,21 @@ MANAGER_PATH = (
     / "kv_offload_decode"
     / "kv_offload_decode_manager.py"
 )
+CONNECTOR_PATH = (
+    ROOT
+    / "vllm_ascend"
+    / "distributed"
+    / "kv_transfer"
+    / "kv_p2p"
+    / "mooncake_layerwise_to_dram_connector.py"
+)
+MULTI_CONNECTOR_PATH = (
+    ROOT
+    / "vllm_ascend"
+    / "distributed"
+    / "kv_transfer"
+    / "ascend_multi_connector.py"
+)
 
 
 def _function_source(path: Path, function_name: str) -> str:
@@ -124,6 +139,31 @@ class TestDSAHostPoolWiring(unittest.TestCase):
             "current_stream().wait_stream",
             source,
         )
+
+    def test_d2rh_connector_registers_shared_pool_on_owner(self):
+        source = _function_source(CONNECTOR_PATH, "register_kv_caches")
+        self.assertIn("is_main_owner = pool.is_owner", source)
+        self.assertIn("pool.register(self.engine)", source)
+        self.assertIn("k_caches_cpu = pool.k_caches", source)
+        self.assertIn("v_caches_cpu = pool.v_caches", source)
+        self.assertNotIn("_reg(k_cpu", source)
+        self.assertNotIn("_reg(v_cpu", source)
+
+    def test_d2rh_main_transfer_has_single_writer(self):
+        source = _function_source(
+            CONNECTOR_PATH,
+            "get_transfer_meta_asymmetric",
+        )
+        self.assertIn("is_main_sender = self.tp_rank == 0", source)
+        self.assertIn("skip_main = not is_main_sender", source)
+
+    def test_multi_connector_forwards_host_pool_binding(self):
+        source = _function_source(
+            MULTI_CONNECTOR_PATH,
+            "bind_runner_host_pool",
+        )
+        self.assertIn("for connector in self._connectors", source)
+        self.assertIn("bind_pool(pool)", source)
 
 
 if __name__ == "__main__":

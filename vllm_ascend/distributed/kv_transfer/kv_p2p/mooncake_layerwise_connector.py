@@ -224,6 +224,8 @@ class KVCacheSendingLayerThread(threading.Thread):
         enable_c8_quant: bool,
         resharding_stream: torch.npu.Stream,
         callback_func: Callable[..., None] = lambda x: None,
+        layer_transfer_finished_events: list[threading.Event] | None = None,
+        layer_transfer_pending_events: list[threading.Event] | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheSendingLayerThread")
         self.engine = engine
@@ -262,6 +264,8 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.enable_c8_quant = enable_c8_quant
         self.ready_event = ready_event
         self.callback_func = callback_func
+        self.layer_transfer_finished_events = layer_transfer_finished_events
+        self.layer_transfer_pending_events = layer_transfer_pending_events
 
     def run(self):
         local_rank = get_world_group().local_rank
@@ -445,6 +449,14 @@ class KVCacheSendingLayerThread(threading.Thread):
         return (src_list, dst_list, length_list)
 
     def _transfer_kv_cache(self, send_task: SendTask):
+        if self.layer_transfer_finished_events is not None:
+            self.layer_transfer_finished_events[send_task.layer_idx].clear()
+        if (
+            self.layer_transfer_pending_events is not None
+            and send_task.send_request
+        ):
+            self.layer_transfer_pending_events[send_task.layer_idx].set()
+
         layer_name = send_task.layer_name
         layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
         key = send_task.k_cache
@@ -525,6 +537,14 @@ class KVCacheSendingLayerThread(threading.Thread):
                                 self.failed_reqs.discard(req_id)
                             else:
                                 self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
+
+        if self.layer_transfer_pending_events is not None:
+            self.layer_transfer_pending_events[send_task.layer_idx].clear()
+        if (
+            self.layer_transfer_finished_events is not None
+            and send_task.send_request
+        ):
+            self.layer_transfer_finished_events[send_task.layer_idx].set()
 
 
 class KVCacheRecvingLayerThread(threading.Thread):
@@ -696,6 +716,7 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
 
 class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     requires_full_blocks_on_update_after_alloc = True
+    supports_layerwise_buffer_reuse = True
 
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
         super().__init__(vllm_config, role, kv_cache_config)
@@ -776,6 +797,10 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         assert isinstance(self._connector_metadata, MooncakeLayerwiseConnectorMetadata)
         self.connector_worker.wait_for_layer_load(layer_name)
 
+    def wait_for_layer_reuse(self, layer_idx: int) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.wait_for_layer_reuse(layer_idx)
+
     def save_kv_layer(
         self, layer_name: str, kv_layer: list[torch.Tensor], attn_metadata: "AttentionMetadata", **kwargs
     ) -> None:
@@ -787,6 +812,12 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_save(self):
         """MooncakeLayerwiseConnector does not save explicitly."""
         pass
+
+    def get_layerwise_reuse_layer_count(self) -> int | None:
+        worker = self.connector_worker
+        if worker is None:
+            return None
+        return getattr(worker, "total_layers", None)
 
 
 class MooncakeLayerwiseConnectorScheduler:
@@ -1154,6 +1185,17 @@ class MooncakeLayerwiseConnectorWorker:
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.side_channel_host = get_ip()
         self.total_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+        self._layer_transfer_finished_events: list[threading.Event] | None = None
+        self._layer_transfer_pending_events: list[threading.Event] | None = None
+        if vllm_config.kv_transfer_config.is_kv_producer:
+            self._layer_transfer_finished_events = [
+                threading.Event() for _ in range(self.total_layers)
+            ]
+            self._layer_transfer_pending_events = [
+                threading.Event() for _ in range(self.total_layers)
+            ]
+            for done in self._layer_transfer_finished_events:
+                done.set()
         self.use_mla = self.vllm_config.model_config.use_mla
         self.request_map = dict[str, str]()
         self.use_attn_mamba_hybrid = False
@@ -1346,13 +1388,16 @@ class MooncakeLayerwiseConnectorWorker:
                 mtp_layer_name = layer_name
                 continue
             self.index_to_name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
-            assert len(self.index_to_name[extract_layer_index(layer_name, num_attn_module)]) == 1, (
+            names = self.index_to_name[
+                extract_layer_index(layer_name, num_attn_module)
+            ]
+            n_indexer = sum(1 for name in names if "indexer" in name.lower())
+            n_other = len(names) - n_indexer
+            assert n_indexer <= 1 and n_other <= 1, (
                 "Mooncake Layerwise Connector does not support multiple `attn_module` in one layer now."
             )
         if mtp_layer_name != "":
             self.index_to_name[max(self.index_to_name.keys()) + 1].append(mtp_layer_name)
-        if self.total_layers < len(self.layer_metadata.keys()):
-            self.total_layers = len(self.layer_metadata.keys())
 
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
@@ -1382,6 +1427,8 @@ class MooncakeLayerwiseConnectorWorker:
                 enable_c8_quant=self.enable_c8_quant,
                 resharding_stream=self.resharding_stream,
                 callback_func=self.send_done_send_signal,
+                layer_transfer_finished_events=self._layer_transfer_finished_events,
+                layer_transfer_pending_events=self._layer_transfer_pending_events,
             )
             self.kv_send_layer_thread.start()
             ready_event.wait()
@@ -1836,6 +1883,17 @@ class MooncakeLayerwiseConnectorWorker:
                 logger.debug("Add request %s to kv send layer thread. req_meta_update=%r", req_id, req_meta_update)
                 layer_send_task.send_request[req_id] = req_meta_update
 
+            if layer_send_task.send_request:
+                pending_events = (
+                    self.kv_send_layer_thread.layer_transfer_pending_events
+                )
+                done_events = (
+                    self.kv_send_layer_thread.layer_transfer_finished_events
+                )
+                if done_events is not None:
+                    done_events[self.current_layer].clear()
+                if pending_events is not None:
+                    pending_events[self.current_layer].set()
             self.kv_send_layer_thread.send_queue.put(layer_send_task)
             self.current_layer += 1
 
@@ -1978,6 +2036,29 @@ class MooncakeLayerwiseConnectorWorker:
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
+
+    def wait_for_layer_reuse(self, layer_idx: int) -> None:
+        send_thread = self.kv_send_layer_thread
+        if send_thread is None:
+            return
+        pending_events = send_thread.layer_transfer_pending_events
+        done_events = send_thread.layer_transfer_finished_events
+        if pending_events is None or done_events is None:
+            return
+        if layer_idx < 0 or layer_idx >= len(done_events):
+            return
+        if not pending_events[layer_idx].is_set():
+            return
+        while not done_events[layer_idx].wait(timeout=10):
+            if not send_thread.is_alive():
+                raise RuntimeError(
+                    "Mooncake send thread stopped while waiting to reuse "
+                    f"layer {layer_idx}"
+                )
+            logger.info(
+                "Waiting for Mooncake transfer to release layer %d",
+                layer_idx,
+            )
 
 
 @contextlib.contextmanager

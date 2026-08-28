@@ -931,6 +931,22 @@ class TestCpuBindingSupplemental(unittest.TestCase):
 
         self.assertEqual(mock_logger_info.call_count, 2)
 
+    @patch(
+        "vllm_ascend.cpu_binding.envs.VLLM_ASCEND_SKIP_MIGRATEPAGES",
+        True,
+    )
+    @patch("vllm_ascend.cpu_binding.execute_command")
+    def test_bind_memory_skips_when_configured(
+        self,
+        mock_execute_command,
+        _mock_skip_migratepages,
+    ):
+        cpu_alloc = make_cpu_alloc()
+
+        cpu_alloc.bind_memory("999", 0)
+
+        mock_execute_command.assert_not_called()
+
     @patch("vllm_ascend.cpu_binding.shutil.which", return_value=None)
     @patch("vllm_ascend.cpu_binding.execute_command")
     def test_bind_memory_skips_when_migratepages_missing(self, mock_execute_command, _mock_which):

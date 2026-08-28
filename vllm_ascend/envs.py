@@ -119,6 +119,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # requires "memfabric". This non-sensitive setting can be overridden by
     # kv_connector_extra_config["transfer_backend"].
     "VLLM_ASCEND_KV_TRANSFER_BACKEND": lambda: os.getenv("VLLM_ASCEND_KV_TRANSFER_BACKEND", "mooncake"),
+    # Skip process-wide NUMA page migration during CPU binding. 0 keeps
+    # migratepages enabled; 1 skips it while retaining CPU thread binding.
+    # This non-sensitive setting is enabled automatically when the Mooncake
+    # Decode Host pool uses mmap + HostRegister.
+    "VLLM_ASCEND_SKIP_MIGRATEPAGES": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SKIP_MIGRATEPAGES", "0"))
+    ),
     # Enable non-sensitive SFA PD transfer diagnostics. 0 disables verbose
     # per-request/per-layer logs (default); 1 enables them.
     "VLLM_ASCEND_SFA_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_DEBUG", "0"))),

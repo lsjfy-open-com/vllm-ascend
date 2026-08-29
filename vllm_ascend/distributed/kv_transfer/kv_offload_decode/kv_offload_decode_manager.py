@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm_ascend.ascend_config import KVOffloadDecodeConfig
 from vllm_ascend.distributed.kv_transfer.kv_offload_decode.host_backend import (
     SFA_KV_OFFLOAD_BACKEND_MOONCAKE,
+    ensure_mooncake_host_is_pd_decode_only,
     kv_transfer_extra_config,
     resolve_sfa_kv_offload_backend,
 )
@@ -277,6 +278,10 @@ class KVOffloadDecodeManager:
         self.sfa_kv_offload_backend = resolve_sfa_kv_offload_backend(
             kv_transfer_extra_config(vllm_config),
             use_fused_overlap_offload=self.use_fused_overlap,
+        )
+        ensure_mooncake_host_is_pd_decode_only(
+            self.sfa_kv_offload_backend,
+            keep_device_kv_cache=kv_offload_decode_config.keep_device_kv_cache,
         )
         self.d2h_index_copy_bypass = self.uses_mooncake_host
         self.runner_host_pool: DSAHostKVPool | None = None

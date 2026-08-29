@@ -54,6 +54,25 @@ def resolve_sfa_kv_offload_backend(
     return requested or SFA_KV_OFFLOAD_BACKEND_MEMFABRIC
 
 
+def ensure_mooncake_host_is_pd_decode_only(
+    backend: str,
+    *,
+    keep_device_kv_cache: bool,
+) -> None:
+    """Mooncake Host is PD-disaggregated decode only.
+
+    ``keep_device_kv_cache`` is the memfabric colocate-debug escape hatch.
+    PD decode keeps that flag false, so this returns immediately.
+    """
+    if not keep_device_kv_cache:
+        return
+    if backend == SFA_KV_OFFLOAD_BACKEND_MOONCAKE:
+        raise RuntimeError(
+            "Mooncake Host backend is PD-disaggregated decode only; "
+            "keep_device_kv_cache (PD-colocate debug) requires memfabric"
+        )
+
+
 def kv_transfer_extra_config(vllm_config: Any) -> Mapping[str, Any] | None:
     kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
     if kv_transfer_config is None:

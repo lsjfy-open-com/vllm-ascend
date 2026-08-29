@@ -79,6 +79,24 @@ class TestSFAHostBackend(unittest.TestCase):
                         use_fused_overlap_offload=True,
                     )
 
+    def test_mooncake_rejects_keep_device_kv_cache(self):
+        BACKEND.ensure_mooncake_host_is_pd_decode_only(
+            BACKEND.SFA_KV_OFFLOAD_BACKEND_MOONCAKE,
+            keep_device_kv_cache=False,
+        )
+        BACKEND.ensure_mooncake_host_is_pd_decode_only(
+            BACKEND.SFA_KV_OFFLOAD_BACKEND_MEMFABRIC,
+            keep_device_kv_cache=True,
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "PD-disaggregated decode only",
+        ):
+            BACKEND.ensure_mooncake_host_is_pd_decode_only(
+                BACKEND.SFA_KV_OFFLOAD_BACKEND_MOONCAKE,
+                keep_device_kv_cache=True,
+            )
+
     def test_extracts_mapping_from_vllm_config(self):
         extra = {"sfa_kv_offload_backend": "mooncake"}
         config = SimpleNamespace(

@@ -288,7 +288,10 @@ def allocate_mooncake_host_region(
 
 
 class DSAHostKVPool:
-    """A single shared allocation partitioned into aligned per-layer views."""
+    """One shared Host allocation, sliced into aligned per-layer K/V views.
+
+    Owner rank (Decode TP0) creates the segment; other TP ranks map it.
+    """
 
     def __init__(
         self,

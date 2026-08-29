@@ -4289,7 +4289,10 @@ class NPUModelRunner(GPUModelRunner):
         kv_cache_config: KVCacheConfig,
         kv_caches: dict[str, torch.Tensor],
     ) -> dsa_host_pool.DSAHostKVPool | None:
-        """Allocate and bind the Mooncake shared Host pool."""
+        """Allocate and bind the Mooncake shared Host pool.
+
+        Decode TP0 creates the share segment; other TP ranks map the same DRAM.
+        """
         if not self._use_fused_overlap_runner_host_alloc():
             return None
 

@@ -618,9 +618,9 @@ def ensure_last_layer_done_signals(
 class MooncakeToDramDecodeScheduler(SFAPDCpuOffloadScheduler):
     """D scheduler: vLLM Main HOST + Indexer HBM ids; advertise for Mooncake Push.
 
-    0723 reuses vLLM's normal block ids: Main ids index
-    ``KVOffloadDecodeManager`` CPU tensors. Unlike memfabric Pull, Mooncake
-    Push needs those dest ids on the wire as ``remote_block_ids``.
+    Main ids index the Decode shared Host pool (TP0 registered). Indexer ids
+    index per-rank HBM. Mooncake Push puts both on the wire as
+    ``remote_block_ids``.
     """
 
     def update_state_after_alloc(
@@ -645,7 +645,8 @@ class MooncakeToDramDecodeScheduler(SFAPDCpuOffloadScheduler):
         self._request_trackers[request.request_id] = (main_block_ids, indexer_block_ids)
         self._reqs_need_recv.add(request.request_id)
 
-        # remote_port is D side-channel *base*; P maps Indexer/Main to base+d_tp_rank.
+        # remote_port is D side-channel *base*. Prefill maps Indexer to
+        # base + d_tp_rank; Main D2RH always targets Decode TP0 owner port.
         kv_transfer_params = dict(
             request_id=get_external_request_id(request.request_id),
             do_remote_prefill=False,
@@ -772,6 +773,7 @@ class MooncakeToDramDecodeWorker:
         v_caches_cpu = pool.v_caches
         is_main_owner = pool.is_owner
         if is_main_owner:
+            # TP0 registers the shared Host pool with TE; peers already map it.
             pool.register(self.engine)
 
         assert self.kv_cache_config is not None
@@ -1418,6 +1420,7 @@ class MooncakeToDramProducerWorker(MooncakeLayerwiseConnectorWorker):
             is_indexer_sender = (
                 tp_ratio <= 1 or (self.tp_rank % tp_ratio) == 0
             )
+            # Main has one writer: Prefill TP0 → Decode TP0 shared Host pool.
             is_main_sender = self.tp_rank == 0
             if not skip_indexer:
                 skip_indexer = not is_indexer_sender
@@ -1641,9 +1644,9 @@ class MooncakeToDramProducerWorker(MooncakeLayerwiseConnectorWorker):
             if send_task.wait_event is not None:
                 send_task.wait_event.synchronize()
 
-            # Indexer D2D only (all Prefill ranks → each Decode TP HBM).
+            # Indexer D2D only (all Prefill ranks → mapped Decode TP HBM).
             _transfer_one_leg(send_task, skip_indexer=False, skip_main=True)
-            # Main D2RH only (Prefill → each Decode TP local Main HOST).
+            # Main D2RH only (Prefill TP0 → Decode TP0 registered shared Host pool).
             _transfer_one_leg(send_task, skip_indexer=True, skip_main=False)
 
             if send_task.layer_idx == (send_thread.total_layers - 1):
@@ -1677,14 +1680,19 @@ class MooncakeToDramProducerWorker(MooncakeLayerwiseConnectorWorker):
         send_thread._transfer_kv_cache = _transfer_kv_cache_split_types  # type: ignore[method-assign]
         logger.info(
             "MooncakeLayerwiseToDram P: asymmetric Push "
-            "(all Prefill TP → mapped Decode TP; "
-            "Indexer D2D then Main D2RH in separate TransferSync; "
-            "DONE decoupled from payload)"
+            "(Indexer: all Prefill TP → mapped Decode TP HBM; "
+            "Main: Prefill TP0 → Decode TP0 shared Host pool; "
+            "separate TransferSync; DONE decoupled from payload)"
         )
 
 
 class MooncakeLayerwiseD2RHConnector(KVConnectorBase_V1, SupportsHMA):
-    """Layerwise Indexer D2D and Main D2RH connector."""
+    """Layerwise Indexer D2D and Main D2RH connector.
+
+    Indexer: Prefill ranks push to the mapped Decode TP HBM.
+    Main: Prefill TP0 pushes to Decode TP0's registered shared Host pool;
+    other Decode TP ranks read that pool through the share-segment local VA.
+    """
 
     # Prefill/Decode PD senders still need real local block ids even when another
     # MultiConnector sibling owns prefix loading.

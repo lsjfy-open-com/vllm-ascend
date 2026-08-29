@@ -107,6 +107,8 @@ class TestDSAHostPoolWiring(unittest.TestCase):
         source = _function_source(MANAGER_PATH, "__init__")
         self.assertIn("resolve_sfa_kv_offload_backend", source)
         self.assertIn("kv_transfer_extra_config(vllm_config)", source)
+        self.assertIn("ensure_mooncake_host_is_pd_decode_only", source)
+        self.assertIn("keep_device_kv_cache=", source)
         mooncake_pos = source.index("if self.uses_mooncake_host")
         initialize_pos = source.index("offload.initialize(config)")
         self.assertLess(mooncake_pos, initialize_pos)
@@ -211,6 +213,12 @@ class TestDSAHostPoolWiring(unittest.TestCase):
         )
         self.assertIn("is_main_sender = self.tp_rank == 0", source)
         self.assertIn("skip_main = not is_main_sender", source)
+        connector = CONNECTOR_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "Prefill TP0 → Decode TP0 registered shared Host pool",
+            connector,
+        )
+        self.assertNotIn("each Decode TP local Main HOST", connector)
 
     def test_multi_connector_forwards_host_pool_binding(self):
         source = _function_source(

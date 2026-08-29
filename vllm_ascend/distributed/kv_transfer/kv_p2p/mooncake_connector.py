@@ -68,7 +68,11 @@ from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
 )
-from vllm_ascend.utils import enable_custom_op, enable_sfa_dcp_replicated_indexer
+from vllm_ascend.utils import (
+    enable_custom_op,
+    enable_sfa_dcp_replicated_indexer,
+    model_uses_sfa_sparse,
+)
 
 # isort: off
 if TYPE_CHECKING:
@@ -567,6 +571,7 @@ class KVCacheRecvingThread(threading.Thread):
         shard_idx: int = 0,
         local_block_ids_replicate_k: BlockIds | None = None,
         remote_block_ids_replicate_k: BlockIds | None = None,
+        use_sfa_replicated_layout: bool | None = None,
     ):
         """Add a new request to the queue for processing."""
         if remote_port_send_num is None:
@@ -577,6 +582,11 @@ class KVCacheRecvingThread(threading.Thread):
             "remote_block_ids": remote_block_ids,
             "local_block_ids_replicate_k": local_block_ids_replicate_k or tuple(),
             "remote_block_ids_replicate_k": remote_block_ids_replicate_k or tuple(),
+            "use_sfa_replicated_layout": (
+                self.enable_sfa_dcp_replicated_indexer
+                if use_sfa_replicated_layout is None
+                else use_sfa_replicated_layout
+            ),
             "group_pulls": group_pulls,
             "remote_engine_id": remote_engine_id,
             "remote_request_id": remote_request_id,
@@ -778,6 +788,10 @@ class KVCacheRecvingThread(threading.Thread):
         remote_block_ids: BlockIds = req_meta["remote_block_ids"]
         local_block_ids_replicate_k: BlockIds = req_meta.get("local_block_ids_replicate_k", tuple())
         remote_block_ids_replicate_k: BlockIds = req_meta.get("remote_block_ids_replicate_k", tuple())
+        use_sfa_replicated_layout = req_meta.get(
+            "use_sfa_replicated_layout",
+            self.enable_sfa_dcp_replicated_indexer,
+        )
         has_replicate_k_blocks = any(local_block_ids_replicate_k) and any(remote_block_ids_replicate_k)
         group_pulls: list[GroupPull] = req_meta["group_pulls"]
         remote_engine_id = req_meta["remote_engine_id"]
@@ -802,6 +816,7 @@ class KVCacheRecvingThread(threading.Thread):
             local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
             remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
             remote_block_stride_per_addr = self.remote_block_stride_per_addr[remote_engine_id][remote_handshake_port]
+            remote_block_size_scale = self.remote_block_size_scale[remote_engine_id][remote_handshake_port]
         session_id = f"{remote_host}:{remote_transfer_port}"
 
         req_start_time = time.perf_counter()
@@ -811,7 +826,7 @@ class KVCacheRecvingThread(threading.Thread):
         attention_group_reformat_block_ids: list[tuple[tuple[int, list[list[int]], int, list[int]], bool]] = []
         grouped_remote_k_block_ids: list[list[int]] = []
         grouped_local_k_block_ids: list[list[int]] = []
-        if self.enable_sfa_dcp_replicated_indexer and has_replicate_k_blocks:
+        if has_replicate_k_blocks:
             grouped_remote_k_block_ids, grouped_local_k_block_ids = group_concurrent_contiguous(
                 remote_block_ids_replicate_k[0],
                 local_block_ids_replicate_k[0],
@@ -833,6 +848,7 @@ class KVCacheRecvingThread(threading.Thread):
             tp_num_need_pulls = group_pull.num_group_pulls
             inner_offset = group_pull.remote_tp_offset
             is_mamba_group = group_spec["kv_cache_spec_type"] == "MambaSpec"
+            is_sfa_group = group_spec["kv_cache_spec_type"] == "AscendMLAAttentionSpec"
             local_group_block_ids = local_block_ids[kv_cache_group_id]
             remote_group_block_ids = remote_block_ids[kv_cache_group_id]
             has_group_blocks = bool(local_group_block_ids)
@@ -913,7 +929,18 @@ class KVCacheRecvingThread(threading.Thread):
                     block_stride = self.block_stride_per_addr[layer_idx][cache_idx]
                     remote_block_stride = remote_block_stride_per_addr[layer_idx][cache_idx]
                     inner_block_len = block_len // tp_num_need_pulls
-                    if self.enable_sfa_dcp_replicated_indexer and self.block_size_scale[layer_idx][cache_idx] > 1:
+                    # In v0.23, regular MLA KV and the SFA Indexer share one
+                    # cache tuple. Only Indexer tensors have a DCP-scaled
+                    # block dimension, on either the local or remote side.
+                    is_sfa_indexer_cache = (
+                        use_sfa_replicated_layout
+                        and is_sfa_group
+                        and (
+                            self.block_size_scale[layer_idx][cache_idx] > 1
+                            or remote_block_size_scale[layer_idx][cache_idx] > 1
+                        )
+                    )
+                    if is_sfa_indexer_cache:
                         if has_replicate_k_blocks:
                             transfer_remote_block_ids = grouped_remote_k_block_ids
                             transfer_local_block_ids = grouped_local_k_block_ids
@@ -3304,7 +3331,7 @@ class MooncakeConnectorWorker:
         self,
         meta: ReqMeta,
     ) -> tuple[BlockIds, BlockIds]:
-        if not self.enable_sfa_dcp_replicated_indexer:
+        if not self._uses_sfa_replicated_indexer_layout(meta):
             return tuple(), tuple()
         if meta.num_external_tokens <= 0 or not meta.remote_block_ids or not meta.local_block_ids:
             return tuple(), tuple()
@@ -3373,6 +3400,16 @@ class MooncakeConnectorWorker:
 
         return (local_block_ids,), (remote_block_ids,)
 
+    def _uses_sfa_replicated_indexer_layout(self, meta: ReqMeta) -> bool:
+        """Whether either endpoint stores SFA Indexer KV in DCP layout."""
+        if self.enable_sfa_dcp_replicated_indexer:
+            return True
+        return (
+            model_uses_sfa_sparse(self.vllm_config.model_config)
+            and meta.remote_dcp_size > 1
+            and meta.remote_pcp_size == 1
+        )
+
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
         for req_id in metadata.reqs_in_batch:
@@ -3394,6 +3431,7 @@ class MooncakeConnectorWorker:
 
             remote_req_id = meta.remote_request_id
             prefill_tp_size: int = meta.remote_ptp_size if meta.remote_ptp_size is not None else self._prefill_tp_size
+            use_sfa_replicated_layout = self._uses_sfa_replicated_indexer_layout(meta)
             (
                 local_block_ids_replicate_k,
                 remote_block_ids_replicate_k,
@@ -3462,6 +3500,7 @@ class MooncakeConnectorWorker:
                         remote_block_size=meta.remote_block_size,
                         local_block_ids_replicate_k=local_block_ids_replicate_k_for_port,
                         remote_block_ids_replicate_k=remote_block_ids_replicate_k_for_port,
+                        use_sfa_replicated_layout=use_sfa_replicated_layout,
                     )
 
         if self.kv_send_thread is not None and self.pcp_size * self.dcp_size == 1:

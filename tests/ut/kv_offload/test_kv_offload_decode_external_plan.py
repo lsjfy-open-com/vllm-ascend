@@ -57,6 +57,7 @@ def _make_plan_manager():
     manager.fused_overlap_membership_map_rows = 0
     manager.fused_overlap_membership_region = None
     manager.fused_overlap_planner_membership_map = None
+    manager.fused_overlap_membership_plan_device_staging = None
     manager.sfa_kv_offload_backend = SFA_KV_OFFLOAD_BACKEND_MEMFABRIC
     manager.fused_overlap_plan_owner_layer_id = None
     manager.fused_overlap_plan_topk = None
@@ -136,6 +137,7 @@ def test_mapped_membership_allocation_initializes_external_plan_control():
     manager.sfa_kv_offload_backend = SFA_KV_OFFLOAD_BACKEND_MEMFABRIC
     manager.fused_overlap_membership_region = None
     manager.fused_overlap_planner_membership_map = None
+    manager.fused_overlap_membership_plan_device_staging = None
     real_zeros = torch.zeros
 
     def cpu_zeros(*args, **kwargs):
@@ -212,9 +214,17 @@ def test_mooncake_membership_uses_shared_operator_and_private_planner_storage():
         membership = manager.allocate_fused_overlap_membership_map(3)
 
     planner = manager.fused_overlap_planner_membership_map
+    device_staging = manager.fused_overlap_membership_plan_device_staging
     assert planner is not None
+    assert device_staging is not None
     assert membership.shape == planner.shape
     assert membership.data_ptr() != planner.data_ptr()
+    assert device_staging.shape == (
+        3,
+        manager.topk + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT,
+    )
+    assert device_staging.data_ptr() != planner.data_ptr()
+    assert device_staging.data_ptr() != membership.data_ptr()
     allocate.assert_called_once()
     current_stream.synchronize.assert_called_once_with()
     manager.tp_group.barrier.assert_called_once_with()
@@ -232,6 +242,13 @@ def test_eager_external_plan_bridges_private_planner_storage():
     planner_membership = torch.full_like(membership, 7)
     manager.fused_overlap_membership_map = membership
     manager.fused_overlap_planner_membership_map = planner_membership
+    manager.fused_overlap_membership_plan_device_staging = torch.empty(
+        (
+            4,
+            manager.topk + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT,
+        ),
+        dtype=torch.int16,
+    )
 
     assert manager.prepare_fused_overlap_external_plan(
         layer_name="layer.0",
@@ -250,9 +267,17 @@ def test_eager_external_plan_bridges_private_planner_storage():
     plan_start = (
         FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT - manager.topk
     )
+    plan_end = (
+        FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT
+        + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT
+    )
     torch.testing.assert_close(
-        membership[:2, plan_start:],
-        planner_membership[:2, plan_start:],
+        membership[:2, plan_start:plan_end],
+        planner_membership[:2, plan_start:plan_end],
+    )
+    torch.testing.assert_close(
+        manager.fused_overlap_membership_plan_device_staging[:2],
+        planner_membership[:2, plan_start:plan_end],
     )
     planner = (
         manager.kv_offload_decode_cpp

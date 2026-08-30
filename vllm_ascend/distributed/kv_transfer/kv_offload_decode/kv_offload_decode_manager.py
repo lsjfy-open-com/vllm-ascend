@@ -301,6 +301,9 @@ class KVOffloadDecodeManager:
         self.fused_overlap_membership_map_rows = 0
         self.fused_overlap_membership_region: DSAHostMemoryRegion | None = None
         self.fused_overlap_planner_membership_map: torch.Tensor | None = None
+        self.fused_overlap_membership_plan_device_staging: (
+            torch.Tensor | None
+        ) = None
         self.fused_overlap_plan_owner_layer_id: int | None = None
         self.fused_overlap_plan_topk: int | None = None
         self.fused_overlap_plan_num_tokens = 0
@@ -602,6 +605,15 @@ class KVOffloadDecodeManager:
                     device="cpu",
                     pin_memory=True,
                 )
+                self.fused_overlap_membership_plan_device_staging = torch.empty(
+                    [
+                        row_capacity,
+                        self.topk
+                        + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT,
+                    ],
+                    dtype=torch.int16,
+                    device=membership_map.device,
+                )
                 self._init_fused_overlap_membership_control(planner_map)
                 self._init_fused_overlap_membership_control(membership_map)
                 torch_npu.npu.current_stream().synchronize()
@@ -635,6 +647,32 @@ class KVOffloadDecodeManager:
 
         self.fused_overlap_membership_map = membership_map
         self.fused_overlap_membership_map_rows = row_capacity
+        if os.getenv("VLLM_ASCEND_SFA_DEBUG", "0") == "1":
+            planner_map = self.fused_overlap_planner_membership_map
+            logger.info(
+                "[fused_overlap_offload][external_plan_debug] stage=membership_alloc "
+                "tp=%s backend=%s rows=%s membership(device=%s shape=%s stride=%s "
+                "contiguous=%s ptr=%#x) planner(device=%s shape=%s stride=%s "
+                "contiguous=%s pinned=%s ptr=%#x same_ptr=%s)",
+                self.tp_rank,
+                self.sfa_kv_offload_backend,
+                row_capacity,
+                membership_map.device,
+                tuple(membership_map.shape),
+                tuple(membership_map.stride()),
+                membership_map.is_contiguous(),
+                membership_map.data_ptr(),
+                None if planner_map is None else planner_map.device,
+                None if planner_map is None else tuple(planner_map.shape),
+                None if planner_map is None else tuple(planner_map.stride()),
+                None if planner_map is None else planner_map.is_contiguous(),
+                None
+                if planner_map is None or planner_map.device.type != "cpu"
+                else planner_map.is_pinned(),
+                0 if planner_map is None else planner_map.data_ptr(),
+                planner_map is not None
+                and planner_map.data_ptr() == membership_map.data_ptr(),
+            )
         return membership_map
 
     def _init_fused_overlap_membership_control(
@@ -1576,14 +1614,129 @@ class KVOffloadDecodeManager:
             plan_start:required_columns,
         ]
         encoded_plan_stride = planner_membership_map.stride(0)
+        external_plan_debug = os.getenv("VLLM_ASCEND_SFA_DEBUG", "0") == "1"
+        if external_plan_debug:
+            logger.info(
+                "[fused_overlap_offload][external_plan_debug] stage=prepare_enter "
+                "tp=%s layer=%s layer_id=%s capturing=%s num_tokens=%s topk=%s "
+                "required_columns=%s plan_start=%s encoded_stride=%s "
+                "membership(device=%s shape=%s stride=%s ptr=%#x) "
+                "planner(device=%s shape=%s stride=%s ptr=%#x) "
+                "plan_storage(shape=%s stride=%s offset=%s ptr=%#x) "
+                "planner_storage(shape=%s stride=%s offset=%s ptr=%#x)",
+                self.tp_rank,
+                layer_name,
+                layer_id,
+                capturing,
+                num_tokens,
+                self.topk,
+                required_columns,
+                plan_start,
+                encoded_plan_stride,
+                selection_membership_map.device,
+                tuple(selection_membership_map.shape),
+                tuple(selection_membership_map.stride()),
+                selection_membership_map.data_ptr(),
+                planner_membership_map.device,
+                tuple(planner_membership_map.shape),
+                tuple(planner_membership_map.stride()),
+                planner_membership_map.data_ptr(),
+                tuple(plan_storage.shape),
+                tuple(plan_storage.stride()),
+                plan_storage.storage_offset(),
+                plan_storage.data_ptr(),
+                tuple(planner_storage.shape),
+                tuple(planner_storage.stride()),
+                planner_storage.storage_offset(),
+                planner_storage.data_ptr(),
+            )
 
         def publish_plan(non_blocking: bool) -> None:
-            if planner_storage.data_ptr() == plan_storage.data_ptr():
+            same_ptr = planner_storage.data_ptr() == plan_storage.data_ptr()
+            device_plan_staging = getattr(
+                self,
+                "fused_overlap_membership_plan_device_staging",
+                None,
+            )
+            if external_plan_debug:
+                logger.info(
+                    "[fused_overlap_offload][external_plan_debug] "
+                    "stage=publish_plan_before tp=%s layer_id=%s "
+                    "non_blocking=%s same_ptr=%s src=%#x dst=%#x",
+                    self.tp_rank,
+                    layer_id,
+                    non_blocking,
+                    same_ptr,
+                    planner_storage.data_ptr(),
+                    plan_storage.data_ptr(),
+                )
+            if same_ptr:
+                if external_plan_debug:
+                    logger.info(
+                        "[fused_overlap_offload][external_plan_debug] "
+                        "stage=publish_plan_after tp=%s layer_id=%s skipped_same_ptr=1",
+                        self.tp_rank,
+                        layer_id,
+                    )
                 return
-            plan_storage.copy_(
+            if device_plan_staging is None:
+                raise RuntimeError(
+                    "external FSA plan requires an NPU staging buffer when "
+                    "planner and operator membership storage are separate"
+                )
+            device_plan_storage = device_plan_staging[
+                :num_tokens,
+                : required_columns - plan_start,
+            ]
+            if external_plan_debug:
+                logger.info(
+                    "[fused_overlap_offload][external_plan_debug] "
+                    "stage=cpu_to_device_staging_before tp=%s layer_id=%s "
+                    "src=%#x dst=%#x shape=%s",
+                    self.tp_rank,
+                    layer_id,
+                    planner_storage.data_ptr(),
+                    device_plan_storage.data_ptr(),
+                    tuple(device_plan_storage.shape),
+                )
+            device_plan_storage.copy_(
                 planner_storage,
                 non_blocking=non_blocking,
             )
+            if external_plan_debug:
+                logger.info(
+                    "[fused_overlap_offload][external_plan_debug] "
+                    "stage=cpu_to_device_staging_after tp=%s layer_id=%s",
+                    self.tp_rank,
+                    layer_id,
+                )
+                logger.info(
+                    "[fused_overlap_offload][external_plan_debug] "
+                    "stage=device_staging_to_membership_before tp=%s "
+                    "layer_id=%s src=%#x dst=%#x shape=%s",
+                    self.tp_rank,
+                    layer_id,
+                    device_plan_storage.data_ptr(),
+                    plan_storage.data_ptr(),
+                    tuple(plan_storage.shape),
+                )
+            plan_storage.copy_(
+                device_plan_storage,
+                non_blocking=non_blocking,
+            )
+            if external_plan_debug:
+                logger.info(
+                    "[fused_overlap_offload][external_plan_debug] "
+                    "stage=device_staging_to_membership_after tp=%s layer_id=%s",
+                    self.tp_rank,
+                    layer_id,
+                )
+                logger.info(
+                    "[fused_overlap_offload][external_plan_debug] "
+                    "stage=publish_plan_after tp=%s layer_id=%s skipped_same_ptr=0",
+                    self.tp_rank,
+                    layer_id,
+                )
 
         owner_layer_id = self.fused_overlap_plan_owner_layer_id
         can_reuse_owner_plan = (
@@ -1613,6 +1766,27 @@ class KVOffloadDecodeManager:
                 if enqueue
                 else self.kv_offload_decode_cpp.lru_resident_compact_with_plan_stable_rows
             )
+            if external_plan_debug:
+                logger.info(
+                    "[fused_overlap_offload][external_plan_debug] stage=planner_before "
+                    "tp=%s layer_id=%s enqueue=%s membership_ptr=%#x "
+                    "encoded_stride=%s num_tokens=%s topk=%s capacity=%s "
+                    "max_model_len=%s req_ids_ptr=%#x topk_ptr=%#x "
+                    "stable_prefix_ptr=%#x visible_seq_ptr=%#x",
+                    self.tp_rank,
+                    layer_id,
+                    enqueue,
+                    planner_storage.data_ptr(),
+                    encoded_plan_stride,
+                    num_tokens,
+                    self.topk,
+                    self.topk_buffer_size,
+                    self.max_model_len,
+                    self.lru_req_ids_ptr,
+                    self.lru_topk_indices_ptr,
+                    self.lru_stable_prefix_lens_ptr,
+                    self.lru_visible_seq_lens_ptr,
+                )
             planner(
                 self.lru_req_ids_ptr,
                 self.lru_last_req_ids_ptrs[layer_id],
@@ -1641,8 +1815,23 @@ class KVOffloadDecodeManager:
                 self.lru_workspace_threads,
                 self.lru_visible_seq_lens_ptr,
             )
+            if external_plan_debug:
+                logger.info(
+                    "[fused_overlap_offload][external_plan_debug] stage=planner_after "
+                    "tp=%s layer_id=%s enqueue=%s",
+                    self.tp_rank,
+                    layer_id,
+                    enqueue,
+                )
 
         if capturing:
+            if external_plan_debug:
+                logger.info(
+                    "[fused_overlap_offload][external_plan_debug] "
+                    "stage=capture_input_schedule_before tp=%s layer_id=%s",
+                    self.tp_rank,
+                    layer_id,
+                )
             plan_inputs_ready = torch_npu.npu.current_stream().record_event()
             with torch_npu.npu.stream(self.fused_plan_stream):
                 self.fused_plan_stream.wait_event(plan_inputs_ready)
@@ -1668,7 +1857,21 @@ class KVOffloadDecodeManager:
                         non_blocking=True,
                     )
                     publish_plan(non_blocking=True)
+                if external_plan_debug:
+                    logger.info(
+                        "[fused_overlap_offload][external_plan_debug] "
+                        "stage=broadcast_before tp=%s layer_id=%s capturing=1",
+                        self.tp_rank,
+                        layer_id,
+                    )
                 self.tp_group.broadcast(self.fused_plan_metadata_npu, src=0)
+                if external_plan_debug:
+                    logger.info(
+                        "[fused_overlap_offload][external_plan_debug] "
+                        "stage=broadcast_after tp=%s layer_id=%s capturing=1",
+                        self.tp_rank,
+                        layer_id,
+                    )
             torch_npu.npu.current_stream().wait_stream(
                 self.fused_plan_stream
             )
@@ -1682,6 +1885,13 @@ class KVOffloadDecodeManager:
         if self.tp_rank == 0:
             self.fused_plan_status_npu.zero_()
             try:
+                if external_plan_debug:
+                    logger.info(
+                        "[fused_overlap_offload][external_plan_debug] "
+                        "stage=input_copy_before tp=%s layer_id=%s capturing=0",
+                        self.tp_rank,
+                        layer_id,
+                    )
                 self.lru_topk_indices_cpu[:num_tokens].copy_(topk_indices_npu)
                 self.lru_req_ids_cpu[:num_tokens].copy_(req_ids_npu)
                 self.lru_stable_prefix_lens_cpu[:num_tokens].copy_(
@@ -1690,18 +1900,53 @@ class KVOffloadDecodeManager:
                 self.lru_visible_seq_lens_cpu[:num_tokens].copy_(
                     visible_seq_lens_npu
                 )
+                if external_plan_debug:
+                    logger.info(
+                        "[fused_overlap_offload][external_plan_debug] "
+                        "stage=input_copy_after tp=%s layer_id=%s capturing=0",
+                        self.tp_rank,
+                        layer_id,
+                    )
                 run_planner(enqueue=False)
+                if external_plan_debug:
+                    logger.info(
+                        "[fused_overlap_offload][external_plan_debug] "
+                        "stage=linear_slots_copy_before tp=%s layer_id=%s",
+                        self.tp_rank,
+                        layer_id,
+                    )
                 self.fused_plan_current_linear_slots_npu[:num_tokens].copy_(
                     self.lru_physical_row_workspace[
                         self.max_num_topk_rows * 2 :
                         self.max_num_topk_rows * 2 + num_tokens
                     ]
                 )
+                if external_plan_debug:
+                    logger.info(
+                        "[fused_overlap_offload][external_plan_debug] "
+                        "stage=linear_slots_copy_after tp=%s layer_id=%s",
+                        self.tp_rank,
+                        layer_id,
+                    )
                 publish_plan(non_blocking=False)
             except Exception as exc:
                 planner_error = exc
                 self.fused_plan_status_npu.fill_(1)
+        if external_plan_debug:
+            logger.info(
+                "[fused_overlap_offload][external_plan_debug] "
+                "stage=broadcast_before tp=%s layer_id=%s capturing=0",
+                self.tp_rank,
+                layer_id,
+            )
         self.tp_group.broadcast(self.fused_plan_metadata_npu, src=0)
+        if external_plan_debug:
+            logger.info(
+                "[fused_overlap_offload][external_plan_debug] "
+                "stage=broadcast_after tp=%s layer_id=%s capturing=0",
+                self.tp_rank,
+                layer_id,
+            )
         if int(self.fused_plan_status_npu.item()) != 0:
             detail = (
                 f"{type(planner_error).__name__}: {planner_error}"
@@ -1842,6 +2087,7 @@ class KVOffloadDecodeManager:
             self.fused_overlap_membership_region = None
         self.fused_overlap_membership_map = None
         self.fused_overlap_planner_membership_map = None
+        self.fused_overlap_membership_plan_device_staging = None
 
 
 _KV_OFFLOAD_DECODE_MANAGER: KVOffloadDecodeManager = None

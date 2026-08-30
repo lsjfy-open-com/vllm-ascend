@@ -125,6 +125,38 @@ DONE_RECVING_MSG = b"done_recving_msg"
 MAX_REQUESTS_PER_PEER_HANDLER = 5
 
 
+def _block_abs_stats(
+    tensor: torch.Tensor,
+    block_id: int,
+    *,
+    byte_offset: int = 0,
+    byte_length: int | None = None,
+) -> tuple[float, float, int]:
+    """Return compact checksum-like stats for one block or byte slice."""
+    if block_id < 0 or block_id >= tensor.shape[0]:
+        raise IndexError(f"block_id={block_id} is outside tensor blocks={tensor.shape[0]}")
+    block = tensor[block_id].detach().reshape(-1)
+    element_size = tensor.element_size()
+    if byte_offset % element_size:
+        raise ValueError(f"byte_offset={byte_offset} is not element aligned")
+    start = byte_offset // element_size
+    if byte_length is None:
+        values = block[start:]
+    else:
+        if byte_length % element_size:
+            raise ValueError(f"byte_length={byte_length} is not element aligned")
+        values = block[start : start + byte_length // element_size]
+    values = values.float()
+    return values.abs().mean().item(), values.abs().sum().item(), values.numel()
+
+
+def _debug_layer_ids(layout: list[list[Any]]) -> tuple[int, ...]:
+    active = [layer_id for layer_id, tensors in enumerate(layout) if tensors]
+    if not active:
+        return ()
+    return (active[0],) if len(active) == 1 else (active[0], active[-1])
+
+
 def _resolve_remote_endpoint(
     base_port: int,
     remote_handshake_port: int,
@@ -431,6 +463,64 @@ class KVCacheSendingThread(threading.Thread):
     def add_delayed_request(self, request_id: str, delay_start_time: float):
         return self.task_tracker.add_delayed_request(request_id, delay_start_time)
 
+    def log_dsa_source_checksums(
+        self,
+        request_id: str,
+        indexer_block_ids: list[int],
+        main_block_ids: list[int],
+    ) -> None:
+        if not ascend_envs.VLLM_ASCEND_SFA_DEBUG:
+            return
+        try:
+            layer_count = len(self.metadata.kv_caches_base_addr)
+            layouts = {
+                "INDEXER_D2D": [[] for _ in range(layer_count)],
+                "MAIN_D2RH": [[] for _ in range(layer_count)],
+            }
+            for group_spec, layer_indices in self.metadata.kv_group2layeridx.values():
+                for layer_name, layer_id in zip(group_spec["layer_names"], layer_indices):
+                    phase = "INDEXER_D2D" if "indexer" in layer_name.lower() else "MAIN_D2RH"
+                    value = self.kv_caches.get(layer_name)
+                    if value is None:
+                        continue
+                    tensors = (value,) if isinstance(value, torch.Tensor) else tuple(value)
+                    layouts[phase][layer_id] = list(tensors)
+
+            for phase, logical_block_ids in (
+                ("INDEXER_D2D", indexer_block_ids),
+                ("MAIN_D2RH", main_block_ids),
+            ):
+                if not logical_block_ids or (phase == "MAIN_D2RH" and self.tp_rank != 0):
+                    continue
+                layout = layouts[phase]
+                logical_block = logical_block_ids[0]
+                for layer_id in _debug_layer_ids(layout):
+                    for position, tensor in enumerate(layout[layer_id]):
+                        scale = self.metadata.block_size_scale[layer_id][position]
+                        physical_block = logical_block * scale
+                        abs_mean, abs_sum, numel = _block_abs_stats(tensor, physical_block)
+                        logger.info(
+                            "blockwise_dsa_checksum side=P phase=%s request_id=%s tp=%s "
+                            "layer=%s position=%s logical_block=%s physical_block=%s "
+                            "abs_mean=%.9g abs_sum=%.9g numel=%s",
+                            phase,
+                            request_id,
+                            self.tp_rank,
+                            layer_id,
+                            position,
+                            logical_block,
+                            physical_block,
+                            abs_mean,
+                            abs_sum,
+                            numel,
+                        )
+        except Exception:
+            logger.warning(
+                "Failed to compute blockwise DSA Prefill checksum for request %s",
+                request_id,
+                exc_info=True,
+            )
+
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
         try:
@@ -609,6 +699,8 @@ class KVCacheRecvingThread(threading.Thread):
         self.remote_block_len_per_addr: dict[str, dict[int, list[list[int]]]] = SizedDict()
         self.remote_kv_group2layeridx: dict[str, dict[int, dict[int, tuple[dict[str, Any], list[int]]]]] = SizedDict()
         self.remote_metadata_lock = threading.Lock()
+        self._dsa_indexer_debug_tensors: list[list[torch.Tensor]] = []
+        self._dsa_main_debug_tensors: list[list[torch.Tensor]] = []
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
         first_kv_cache = next(iter(self.kv_caches.values()))
@@ -932,6 +1024,71 @@ class KVCacheRecvingThread(threading.Thread):
             lengths[:3],
         )
 
+    def _log_dsa_destination_checksums(
+        self,
+        *,
+        phase: str,
+        command: DsaStepRequest,
+        source_block_ids: list[int],
+        destination_block_ids: list[int],
+        remote_scales: list[list[int]],
+        remote_lens: list[list[int]],
+    ) -> None:
+        if not ascend_envs.VLLM_ASCEND_SFA_DEBUG or not source_block_ids or not destination_block_ids:
+            return
+        try:
+            layout = (
+                self._dsa_indexer_debug_tensors
+                if phase == "INDEXER_D2D"
+                else self._dsa_main_debug_tensors
+            )
+            source_block = source_block_ids[0]
+            destination_block = destination_block_ids[0]
+            for layer_id in _debug_layer_ids(layout):
+                for position, tensor in enumerate(layout[layer_id]):
+                    byte_offset = 0
+                    byte_length = None
+                    page_slot = 0
+                    if phase == "INDEXER_D2D":
+                        remote_len = remote_lens[layer_id][position]
+                        local_block_len = tensor.element_size() * math.prod(tensor.shape[1:])
+                        if local_block_len % remote_len:
+                            raise ValueError(
+                                f"local Indexer block length {local_block_len} is not divisible by "
+                                f"remote length {remote_len}"
+                            )
+                        byte_length = remote_len
+                        byte_offset = page_slot * remote_len
+                    abs_mean, abs_sum, numel = _block_abs_stats(
+                        tensor,
+                        destination_block,
+                        byte_offset=byte_offset,
+                        byte_length=byte_length,
+                    )
+                    logger.info(
+                        "blockwise_dsa_checksum side=D phase=%s request_id=%s tp=%s "
+                        "layer=%s position=%s source_block=%s destination_block=%s "
+                        "page_slot=%s abs_mean=%.9g abs_sum=%.9g numel=%s",
+                        phase,
+                        command.request_id,
+                        self.tp_rank,
+                        layer_id,
+                        position,
+                        source_block,
+                        destination_block,
+                        page_slot,
+                        abs_mean,
+                        abs_sum,
+                        numel,
+                    )
+        except Exception:
+            logger.warning(
+                "Failed to compute blockwise DSA Decode checksum for request %s phase=%s",
+                command.request_id,
+                phase,
+                exc_info=True,
+            )
+
     def _execute_dsa_receive(
         self,
         command: DsaStepRequest,
@@ -1013,6 +1170,14 @@ class KVCacheRecvingThread(threading.Thread):
                         indexer_lists[2][:4],
                     )
                 elif is_cancelled is None or not is_cancelled():
+                    self._log_dsa_destination_checksums(
+                        phase="INDEXER_D2D",
+                        command=command,
+                        source_block_ids=source.indexer_block_ids,
+                        destination_block_ids=command.destination.indexer_hbm_block_ids,
+                        remote_scales=remote_scales,
+                        remote_lens=remote_lens,
+                    )
                     if getattr(self, "_dsa_main_owner", True):
                         main_lists = self._build_dsa_transfer_lists(
                             self._dsa_main_local_layout,
@@ -1064,6 +1229,14 @@ class KVCacheRecvingThread(threading.Thread):
                             main_lists[2][:4],
                         )
                     else:
+                        self._log_dsa_destination_checksums(
+                            phase="MAIN_D2RH",
+                            command=command,
+                            source_block_ids=source.main_block_ids,
+                            destination_block_ids=command.destination.main_bound_host_block_ids,
+                            remote_scales=remote_scales,
+                            remote_lens=remote_lens,
+                        )
                         result_kind = DsaLocalResultKind.RECEIVE_COMPLETE
         finally:
             self._send_done_recv_signal(
@@ -1951,6 +2124,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.requests: dict[str, ReqMeta] = {}
         self.requests_to_send: dict[str, float] = {}
+        self.dsa_debug_source_blocks: dict[str, tuple[list[int], list[int]]] = {}
         self.reqs_in_batch: set[str] = set()
 
     def add_new_req(
@@ -2800,11 +2974,21 @@ class MooncakeConnectorScheduler:
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[str, tuple[Request, BlockIds, BlockIds, int]] = {}
         self._reqs_need_send: dict[str, float] = {}
+        self._dsa_debug_source_blocks: dict[str, tuple[list[int], list[int]]] = {}
         self._reqs_in_batch: set[str] = set()
 
         # master-slave meta information for cross-nodes
         self.multi_nodes_meta_mapping: dict[str, dict[str, Any]] = {}
         self.kv_cache_groups = kv_cache_config.kv_cache_groups
+        self._dsa_main_group_idx: int | None = None
+        self._dsa_indexer_group_idx: int | None = None
+        if (
+            ascend_envs.VLLM_ASCEND_SFA_DEBUG
+            and vllm_config.kv_transfer_config.get_from_extra_config("dsa_pd_offload", False)
+        ):
+            self._dsa_main_group_idx, self._dsa_indexer_group_idx = infer_sfa_component_group_ids(
+                kv_cache_config
+            )
         self.use_hybrid = (
             not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
             and any(not isinstance(g.kv_cache_spec, FullAttentionSpec) for g in kv_cache_config.kv_cache_groups)
@@ -3014,6 +3198,8 @@ class MooncakeConnectorScheduler:
         self._reqs_need_recv.clear()
         meta.requests_to_send = self._reqs_need_send
         self._reqs_need_send = {}
+        meta.dsa_debug_source_blocks = self._dsa_debug_source_blocks
+        self._dsa_debug_source_blocks = {}
         meta.reqs_in_batch = self._reqs_in_batch
         self._reqs_in_batch = set()
 
@@ -3049,6 +3235,11 @@ class MooncakeConnectorScheduler:
         if delay_free_blocks:
             logger.info("Delaying free of %d blocks for request %s", sum(computed_block_lens), request.request_id)
             self._reqs_need_send[request.request_id] = time.time()
+            if self._dsa_main_group_idx is not None and self._dsa_indexer_group_idx is not None:
+                self._dsa_debug_source_blocks[request.request_id] = (
+                    list(computed_block_ids[self._dsa_indexer_group_idx]),
+                    list(computed_block_ids[self._dsa_main_group_idx]),
+                )
 
         return delay_free_blocks, dict(
             do_remote_prefill=True,
@@ -3621,6 +3812,8 @@ class MooncakeConnectorWorker:
         layer_count = len(self.kv_caches_base_addr)
         indexer_layout = [[] for _ in range(layer_count)]
         main_layout = [[] for _ in range(layer_count)]
+        indexer_debug_tensors: list[list[torch.Tensor]] = [[] for _ in range(layer_count)]
+        main_debug_tensors: list[list[torch.Tensor]] = [[] for _ in range(layer_count)]
         host_tensors: list[torch.Tensor] = []
 
         def tensor_entry(
@@ -3654,6 +3847,7 @@ class MooncakeConnectorWorker:
         for layer_name in indexer_names:
             layer_idx = layer_name_to_idx[layer_name]
             cache_tuple = self._as_kv_cache_tuple(kv_caches[layer_name])
+            indexer_debug_tensors[layer_idx] = list(cache_tuple)
             for position, tensor in enumerate(cache_tuple):
                 indexer_layout[layer_idx].append(
                     tensor_entry(
@@ -3672,6 +3866,7 @@ class MooncakeConnectorWorker:
                 layer_idx = layer_name_to_idx[layer_name]
                 host_k = pool.k_caches[offload_layer_id]
                 host_v = pool.v_caches[offload_layer_id]
+                main_debug_tensors[layer_idx] = [host_k, host_v]
                 main_layout[layer_idx].extend(
                     (
                         tensor_entry(0, host_k, require_exact_capacity=True),
@@ -3686,6 +3881,8 @@ class MooncakeConnectorWorker:
             logical_tensor_count=len(host_tensors),
             logical_total_bytes=sum(tensor.element_size() * tensor.numel() for tensor in host_tensors),
         )
+        self._dsa_indexer_debug_tensors = indexer_debug_tensors
+        self._dsa_main_debug_tensors = main_debug_tensors
         return indexer_layout, main_layout, host_regions
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -3806,7 +4003,12 @@ class MooncakeConnectorWorker:
             indexer_layout, main_layout, host_regions = self._build_dsa_local_layouts(
                 kv_caches, layer_name_to_idx
             )
-            dsa_local_layouts = (indexer_layout, main_layout)
+            dsa_local_layouts = (
+                indexer_layout,
+                main_layout,
+                self._dsa_indexer_debug_tensors,
+                self._dsa_main_debug_tensors,
+            )
             device_n = len(register_regions.ptrs)
             host_n = len(host_regions.ptrs)
             logger.info(
@@ -3888,6 +4090,8 @@ class MooncakeConnectorWorker:
                 (
                     self.kv_recv_thread._dsa_indexer_local_layout,
                     self.kv_recv_thread._dsa_main_local_layout,
+                    self.kv_recv_thread._dsa_indexer_debug_tensors,
+                    self.kv_recv_thread._dsa_main_debug_tensors,
                 ) = dsa_local_layouts
                 self.kv_recv_thread._dsa_main_owner = (
                     self._pending_runner_host_pool.is_owner
@@ -4922,6 +5126,13 @@ class MooncakeConnectorWorker:
                     else self._prefill_get_remote_rank(req_id)
                 )
                 if self.tp_rank in source_ranks:
+                    source_blocks = metadata.dsa_debug_source_blocks.get(req_id)
+                    if source_blocks is not None:
+                        self.kv_send_thread.log_dsa_source_checksums(
+                            req_id,
+                            indexer_block_ids=source_blocks[0],
+                            main_block_ids=source_blocks[1],
+                        )
                     self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
                 else:
                     self.kv_send_thread.add_not_transfer_request(req_id)

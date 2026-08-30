@@ -47,6 +47,8 @@ def create_vllm_config(
     max_num_seqs: int = 16,
     max_num_batched_tokens: int = 1024,
     block_size: int = 128,
+    kv_role: str = "kv_both",
+    kv_connector_extra_config: dict[str, Any] | None = None,
 ) -> VllmConfig:
     """Initialize VllmConfig For Testing."""
     fake_weight_path = os.path.join(os.path.dirname(__file__), "..", "_fake_weight")
@@ -67,7 +69,11 @@ def create_vllm_config(
         cache_dtype="auto",
         enable_prefix_caching=True,
     )
-    kv_transfer_config = KVTransferConfig(kv_connector="MooncakeConnector", kv_role="kv_both")
+    kv_transfer_config = KVTransferConfig(
+        kv_connector="MooncakeConnector",
+        kv_role=kv_role,
+        kv_connector_extra_config=kv_connector_extra_config or {},
+    )
     return VllmConfig(
         scheduler_config=scheduler_config,
         model_config=model_config,
@@ -80,16 +86,30 @@ def create_vllm_config(
 def create_scheduler(
     vllm_config: VllmConfig,
     num_blocks: int = 10000,
+    group_block_sizes: tuple[int, ...] | None = None,
 ) -> Scheduler:
     """Initialize Scheduler For Testing."""
     block_size = vllm_config.cache_config.block_size
+    group_block_sizes = group_block_sizes or (block_size,)
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
-                ["layer"], FullAttentionSpec(block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float16)
+                [
+                    (
+                        "model.layers.0.indexer.k_cache"
+                        if len(group_block_sizes) > 1 and index == 0
+                        else (
+                            f"model.layers.{index}.self_attn.attn"
+                            if len(group_block_sizes) > 1
+                            else "layer"
+                        )
+                    )
+                ],
+                FullAttentionSpec(block_size=size, num_kv_heads=1, head_size=1, dtype=torch.float16),
             )
+            for index, size in enumerate(group_block_sizes)
         ],
     )
     vllm_config.cache_config.num_gpu_blocks = num_blocks
@@ -99,6 +119,7 @@ def create_scheduler(
         kv_cache_config=kv_cache_config,
         log_stats=True,
         block_size=block_size,
+        hash_block_size=min(group_block_sizes),
         structured_output_manager=StructuredOutputManager(vllm_config),
     )
 

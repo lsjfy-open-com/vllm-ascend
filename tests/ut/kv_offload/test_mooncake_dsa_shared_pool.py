@@ -10,11 +10,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (
     MooncakeConnectorWorker,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_metadata import (
-    DestinationOwnership,
-    DsaAction,
     DsaLocalResultKind,
     DsaStepRequest,
-    LifecycleCommand,
     RemoteEndpoint,
     RemoteSource,
 )
@@ -55,8 +52,8 @@ def test_blockwise_receive_writes_shared_main_only_on_owner(main_owner):
     command = DsaStepRequest(
         request_id="req",
         source=RemoteSource("remote-req", (endpoint,), (1,), (2,)),
-        destination=DestinationOwnership(0, 4, (12,), (11,)),
-        lifecycle=LifecycleCommand(0, 0, DsaAction.RECEIVE_REMOTE, 0, 1, 0),
+        main_host_block_ids=(12,),
+        indexer_hbm_block_ids=(11,),
     )
     results = []
 
@@ -101,21 +98,3 @@ def test_local_layout_uses_shared_pool_only_on_owner(main_owner):
     else:
         assert not any(main_layout)
         assert host_regions.logical_tensor_count == 0
-
-
-@pytest.mark.parametrize("main_owner, expected", [(True, 96), (False, 0)])
-def test_replay_skipped_d2h_bytes_counted_only_by_main_owner(
-    main_owner, expected
-):
-    worker = object.__new__(MooncakeConnectorWorker)
-    worker._pending_runner_host_pool = SimpleNamespace(is_owner=main_owner)
-    worker.decode_manager = SimpleNamespace(
-        offload_layer_names=["layer.0", "layer.1"],
-        token_size_bytes_k=8,
-        token_size_bytes_v=8,
-    )
-    command = SimpleNamespace(
-        lifecycle=SimpleNamespace(preserved_main_tokens=3)
-    )
-
-    assert worker._dsa_skipped_d2h_bytes(command) == expected

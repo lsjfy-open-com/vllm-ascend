@@ -89,22 +89,14 @@ from vllm_ascend.distributed.utils import (
 from vllm_ascend.utils import enable_custom_op, enable_sfa_dcp_replicated_indexer
 
 from .mooncake_dsa_metadata import (
-    D2HStepProgress,
-    DestinationOwnership,
-    DsaAction,
     DsaConnectorMetadata,
-    DsaD2HStepPlan,
     DsaLocalResult,
     DsaLocalResultKind,
     DsaStepRequest,
     DsaTransferPhase,
     DsaWorkerResultMetadata,
-    LifecycleCommand,
     RemoteEndpoint,
     RemoteSource,
-    validate_action_result,
-    validate_bound_main_capacity,
-    validate_d2h_plan_capacity,
 )
 
 # isort: off
@@ -1137,7 +1129,7 @@ class KVCacheRecvingThread(threading.Thread):
                     remote_scales,
                     remote_lens,
                     source.indexer_block_ids,
-                    command.destination.indexer_hbm_block_ids,
+                    command.indexer_hbm_block_ids,
                     allow_empty=True,
                 )
                 if logger.isEnabledFor(logging.INFO):
@@ -1150,7 +1142,7 @@ class KVCacheRecvingThread(threading.Thread):
                         remote_scales=remote_scales,
                         remote_lens=remote_lens,
                         source_block_ids=source.indexer_block_ids,
-                        destination_block_ids=command.destination.indexer_hbm_block_ids,
+                        destination_block_ids=command.indexer_hbm_block_ids,
                         transfer_lists=indexer_lists,
                     )
                 if indexer_lists[0] and self.engine.batch_transfer_sync_read(session_id, *indexer_lists) < 0:
@@ -1164,7 +1156,7 @@ class KVCacheRecvingThread(threading.Thread):
                         session_id,
                         len(indexer_lists[0]),
                         source.indexer_block_ids[:8],
-                        command.destination.indexer_hbm_block_ids[:8],
+                        command.indexer_hbm_block_ids[:8],
                         indexer_lists[0][:4],
                         indexer_lists[1][:4],
                         indexer_lists[2][:4],
@@ -1174,7 +1166,7 @@ class KVCacheRecvingThread(threading.Thread):
                         phase="INDEXER_D2D",
                         command=command,
                         source_block_ids=source.indexer_block_ids,
-                        destination_block_ids=command.destination.indexer_hbm_block_ids,
+                        destination_block_ids=command.indexer_hbm_block_ids,
                         remote_scales=remote_scales,
                         remote_lens=remote_lens,
                     )
@@ -1186,7 +1178,7 @@ class KVCacheRecvingThread(threading.Thread):
                             remote_scales,
                             remote_lens,
                             source.main_block_ids,
-                            command.destination.main_bound_host_block_ids,
+                            command.main_host_block_ids,
                         )
                     else:
                         # The runner-owned Host pool is shared by Decode TP
@@ -1203,7 +1195,7 @@ class KVCacheRecvingThread(threading.Thread):
                             remote_scales=remote_scales,
                             remote_lens=remote_lens,
                             source_block_ids=source.main_block_ids,
-                            destination_block_ids=command.destination.main_bound_host_block_ids,
+                            destination_block_ids=command.main_host_block_ids,
                             transfer_lists=main_lists,
                         )
                     if (
@@ -1223,7 +1215,7 @@ class KVCacheRecvingThread(threading.Thread):
                             session_id,
                             len(main_lists[0]),
                             source.main_block_ids[:8],
-                            command.destination.main_bound_host_block_ids[:8],
+                            command.main_host_block_ids[:8],
                             main_lists[0][:4],
                             main_lists[1][:4],
                             main_lists[2][:4],
@@ -1233,7 +1225,7 @@ class KVCacheRecvingThread(threading.Thread):
                             phase="MAIN_D2RH",
                             command=command,
                             source_block_ids=source.main_block_ids,
-                            destination_block_ids=command.destination.main_bound_host_block_ids,
+                            destination_block_ids=command.main_host_block_ids,
                             remote_scales=remote_scales,
                             remote_lens=remote_lens,
                         )
@@ -1251,8 +1243,6 @@ class KVCacheRecvingThread(threading.Thread):
             if cancelled or result_kind is None
             else DsaLocalResult(
                 command.request_id,
-                command.lifecycle.execution_epoch,
-                command.lifecycle.command_seq,
                 self.tp_rank,
                 result_kind,
                 failure_phase,
@@ -2155,54 +2145,36 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
 
 
 @dataclass(slots=True)
-class _DsaIssuedD2HStep:
-    plan: DsaD2HStepPlan
-    progress_by_rank: dict[int, D2HStepProgress] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
 class _DsaSchedulerRequest:
+    """Scheduler state for one remote-prefill receive."""
+
     request: Any
     source: RemoteSource
-    reservation_id: int
-    main_reservation_block_count: int
-    main_block_ids: list[int]
     num_computed_tokens: int
     num_external_tokens: int
+    main_block_ids: tuple[int, ...] = ()
     indexer_hbm_block_ids: tuple[int, ...] = ()
-    main_bound_block_count: int = 0
     command_emitted: bool = False
-    execution_epoch: int = 0
-    command_seq: int = 0
-    active_action: DsaAction | None = DsaAction.RECEIVE_REMOTE
-    issued_main_tokens: int = 0
-    confirmed_main_tokens: int = 0
-    next_d2h_step_seq: int = 0
-    d2h_ledger: dict[int, _DsaIssuedD2HStep] = field(default_factory=dict)
-    awaiting_rebind: bool = False
-    preemption_pending: bool = False
-    terminal_pending: bool = False
-    terminal_results: dict[int, DsaLocalResult] = field(default_factory=dict)
+    results_by_rank: dict[int, DsaLocalResult] = field(default_factory=dict)
 
 
 class _MooncakeDsaDecodeScheduler(SFAPDCpuOffloadScheduler):
+    """Build one-shot blockwise PD receives for the Decode workers."""
+
     def __init__(
         self,
         vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig | None,
     ) -> None:
-        super().__init__(
-            vllm_config,
-            True,
-            kv_cache_config,
-        )
-        self._max_model_len = vllm_config.model_config.max_model_len
+        super().__init__(vllm_config, True, kv_cache_config)
         self._main_block_size = self.block_size[self.main_group_idx]
         self._dsa_requests: dict[str, _DsaSchedulerRequest] = {}
-        self._dsa_prefill_tp_size = _parse_dsa_topology(vllm_config, "prefill").tp_size
-        self._next_reservation_id = 0
-        self._dsa_hol_blocked = False
-        self._expected_tp_ranks = frozenset(range(vllm_config.parallel_config.tensor_parallel_size))
+        self._dsa_prefill_tp_size = _parse_dsa_topology(
+            vllm_config, "prefill"
+        ).tp_size
+        self._expected_tp_ranks = frozenset(
+            range(vllm_config.parallel_config.tensor_parallel_size)
+        )
 
     def get_num_new_matched_tokens(
         self,
@@ -2211,14 +2183,7 @@ class _MooncakeDsaDecodeScheduler(SFAPDCpuOffloadScheduler):
     ) -> tuple[int | None, bool]:
         existing = self._dsa_requests.get(request.request_id)
         if existing is not None:
-            if existing.awaiting_rebind:
-                return request.num_tokens, True
-            if existing.active_action is DsaAction.RECEIVE_REMOTE:
-                return existing.num_external_tokens, True
-            if existing.active_action is DsaAction.PREPARE_REPLAY:
-                return None, False
-            return 0, False
-
+            return existing.num_external_tokens, True
         params = request.kv_transfer_params
         if params is None or not params.get("do_remote_prefill"):
             return 0, False
@@ -2226,10 +2191,9 @@ class _MooncakeDsaDecodeScheduler(SFAPDCpuOffloadScheduler):
         external_tokens = max(prompt_tokens - num_computed_tokens, 0)
         if external_tokens == 0:
             return 0, False
-        if self._dsa_hol_blocked:
-            return None, False
-
-        remote_groups = tuple(tuple(group) for group in params["remote_block_ids"])
+        remote_groups = tuple(
+            tuple(group) for group in params["remote_block_ids"]
+        )
         if not remote_groups:
             raise ValueError("remote_block_ids must contain at least one group")
         source = RemoteSource(
@@ -2238,29 +2202,20 @@ class _MooncakeDsaDecodeScheduler(SFAPDCpuOffloadScheduler):
                 remote_host=params["remote_host"],
                 remote_port=params["remote_port"],
                 remote_engine_id=params["remote_engine_id"],
-                remote_multi_nodes_meta_mapping=params.get("remote_multi_nodes_meta_mapping"),
+                remote_multi_nodes_meta_mapping=params.get(
+                    "remote_multi_nodes_meta_mapping"
+                ),
                 prefill_tp_size=self._dsa_prefill_tp_size,
             ),
             indexer_block_ids=remote_groups[0],
-            main_block_ids=(remote_groups[0] if len(remote_groups) == 1 else remote_groups[-1]),
+            main_block_ids=remote_groups[0] if len(remote_groups) == 1 else remote_groups[-1],
         )
-        reservation_tokens = min(
-            self._max_model_len,
-            prompt_tokens + request.max_tokens,
-        )
-        reservation_blocks = cdiv(reservation_tokens, self._main_block_size)
         self._dsa_requests[request.request_id] = _DsaSchedulerRequest(
             request=request,
             source=source,
-            reservation_id=self._next_reservation_id,
-            main_reservation_block_count=reservation_blocks,
-            # Decode Main blocks are allocated by vLLM and bind directly to
-            # the runner-owned shared Host pool in update_state_after_alloc.
-            main_block_ids=[],
             num_computed_tokens=num_computed_tokens,
             num_external_tokens=external_tokens,
         )
-        self._next_reservation_id += 1
         return external_tokens, True
 
     def update_state_after_alloc(
@@ -2272,8 +2227,6 @@ class _MooncakeDsaDecodeScheduler(SFAPDCpuOffloadScheduler):
         tracker = self._dsa_requests.get(request.request_id)
         if tracker is None:
             return
-        if tracker.terminal_pending:
-            return
         groups = tuple(tuple(group) for group in blocks.get_block_ids())
         required_group = max(self.main_group_idx, self.indexer_group_idx)
         if len(groups) <= required_group:
@@ -2281,26 +2234,16 @@ class _MooncakeDsaDecodeScheduler(SFAPDCpuOffloadScheduler):
                 "Blockwise DSA allocation is missing SFA KV cache groups: "
                 f"required={required_group + 1}, got={len(groups)}"
             )
-        if not groups[self.indexer_group_idx]:
+        indexer_block_ids = groups[self.indexer_group_idx]
+        if not indexer_block_ids:
             raise ValueError("Indexer destination block IDs must not be empty")
-        if tracker.awaiting_rebind:
-            tracker.indexer_hbm_block_ids = groups[self.indexer_group_idx]
-            tracker.main_block_ids = list(groups[self.main_group_idx])
-            tracker.active_action = DsaAction.PREPARE_REPLAY
-            tracker.command_emitted = False
-            tracker.awaiting_rebind = False
-            tracker.num_external_tokens = 0
-            tracker.terminal_results.clear()
-            return
         bound_tokens = tracker.num_computed_tokens + num_external_tokens
         bound_blocks = cdiv(bound_tokens, self._main_block_size)
-        tracker.indexer_hbm_block_ids = groups[self.indexer_group_idx]
-        tracker.main_block_ids = list(groups[self.main_group_idx])
-        if bound_blocks > tracker.main_reservation_block_count:
-            raise ValueError("Main bound prefix exceeds lifetime reservation")
-        if bound_blocks > len(tracker.main_block_ids):
+        main_block_ids = groups[self.main_group_idx]
+        if bound_blocks > len(main_block_ids):
             raise ValueError("vLLM has not allocated enough Main Host blocks")
-        tracker.main_bound_block_count = bound_blocks
+        tracker.indexer_hbm_block_ids = indexer_block_ids
+        tracker.main_block_ids = main_block_ids[:bound_blocks]
         if isinstance(request.kv_transfer_params, dict):
             request.kv_transfer_params["do_remote_prefill"] = False
 
@@ -2308,346 +2251,72 @@ class _MooncakeDsaDecodeScheduler(SFAPDCpuOffloadScheduler):
         self,
         scheduler_output: SchedulerOutput,
     ) -> DsaConnectorMetadata:
-        try:
-            cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
-            if cached is not None:
-                for req_id, new_groups in zip(cached.req_ids, cached.new_block_ids):
-                    tracker = self._dsa_requests.get(req_id)
-                    if tracker is None or new_groups is None:
-                        continue
-                    normalized = tuple(tuple(group) for group in new_groups)
-                    required_group = max(self.main_group_idx, self.indexer_group_idx)
-                    if len(normalized) <= required_group:
-                        raise ValueError(
-                            "Blockwise DSA cached allocation is missing SFA "
-                            f"groups for {req_id!r}"
-                        )
-                    tracker.main_block_ids.extend(normalized[self.main_group_idx])
-                    tracker.indexer_hbm_block_ids += normalized[self.indexer_group_idx]
-            self._mark_preempted(scheduler_output)
-            staged_d2h = self._build_scheduled_d2h_plans(scheduler_output)
-            d2h_plans = tuple(plan for plan, _ in staged_d2h)
-            requests: list[DsaStepRequest] = []
-            for request_id in sorted(self._dsa_requests):
-                tracker = self._dsa_requests[request_id]
-                if tracker.command_emitted or tracker.active_action is None:
-                    continue
-                if not tracker.indexer_hbm_block_ids and tracker.active_action is not DsaAction.QUIESCE:
-                    continue
-                action = tracker.active_action
-                command = DsaStepRequest(
+        del scheduler_output
+        requests: list[DsaStepRequest] = []
+        for request_id in sorted(self._dsa_requests):
+            tracker = self._dsa_requests[request_id]
+            if (
+                tracker.command_emitted
+                or not tracker.indexer_hbm_block_ids
+                or not tracker.main_block_ids
+            ):
+                continue
+            requests.append(
+                DsaStepRequest(
                     request_id=request_id,
-                    source=(tracker.source if action is DsaAction.RECEIVE_REMOTE else None),
-                    destination=DestinationOwnership(
-                        main_reservation_id=tracker.reservation_id,
-                        main_reservation_block_count=tracker.main_reservation_block_count,
-                        main_bound_host_block_ids=tuple(tracker.main_block_ids[: tracker.main_bound_block_count]),
-                        indexer_hbm_block_ids=(tracker.indexer_hbm_block_ids),
-                    ),
-                    lifecycle=LifecycleCommand(
-                        execution_epoch=tracker.execution_epoch,
-                        command_seq=tracker.command_seq,
-                        action=action,
-                        num_computed_tokens=(tracker.num_computed_tokens),
-                        num_external_tokens=(tracker.num_external_tokens),
-                        preserved_main_tokens=(tracker.confirmed_main_tokens),
+                    source=tracker.source,
+                    main_host_block_ids=tracker.main_block_ids,
+                    indexer_hbm_block_ids=(
+                        tracker.indexer_hbm_block_ids
                     ),
                 )
-                validate_bound_main_capacity(command, self._main_block_size)
-                requests.append(command)
-                tracker.command_emitted = True
-            live_reservation_ids = tuple(sorted(tracker.reservation_id for tracker in self._dsa_requests.values()))
-            metadata = DsaConnectorMetadata(
-                tuple(requests),
-                d2h_plans,
-                self._next_reservation_id,
-                live_reservation_ids,
             )
-            for plan, computed_tokens in staged_d2h:
-                tracker = self._dsa_requests[plan.request_id]
-                tracker.main_bound_block_count = len(plan.main_bound_host_block_ids)
-                tracker.num_computed_tokens = computed_tokens
-                tracker.num_external_tokens = 0
-                tracker.d2h_ledger[plan.d2h_step_seq] = _DsaIssuedD2HStep(plan)
-                tracker.next_d2h_step_seq += 1
-                tracker.issued_main_tokens = plan.token_end
-            return metadata
-        finally:
-            self._dsa_hol_blocked = False
-
-    def _mark_preempted(self, scheduler_output: Any) -> None:
-        for request_id in getattr(scheduler_output, "preempted_req_ids", ()):
-            tracker = self._dsa_requests.get(request_id)
-            if tracker is None or tracker.preemption_pending or tracker.terminal_pending:
-                continue
-            tracker.execution_epoch += 1
-            tracker.command_seq += 1
-            tracker.indexer_hbm_block_ids = ()
-            tracker.active_action = None
-            tracker.command_emitted = False
-            tracker.awaiting_rebind = True
-            tracker.preemption_pending = True
-            tracker.num_computed_tokens = 0
-            tracker.issued_main_tokens = tracker.confirmed_main_tokens
-            tracker.next_d2h_step_seq = 0
-            tracker.d2h_ledger.clear()
-            tracker.terminal_results.clear()
-
-    def _build_scheduled_d2h_plans(
-        self,
-        scheduler_output: Any,
-    ) -> list[tuple[DsaD2HStepPlan, int]]:
-        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
-        computed_by_request = dict(zip(cached.req_ids, cached.num_computed_tokens)) if cached is not None else {}
-        for request in getattr(scheduler_output, "scheduled_new_reqs", ()):
-            computed_by_request[request.req_id] = request.num_computed_tokens
-
-        spec_tokens = getattr(scheduler_output, "scheduled_spec_decode_tokens", {})
-        plans: list[tuple[DsaD2HStepPlan, int]] = []
-        for request_id, scheduled_tokens in sorted(getattr(scheduler_output, "num_scheduled_tokens", {}).items()):
-            tracker = self._dsa_requests.get(request_id)
-            if tracker is None or tracker.terminal_pending or tracker.active_action is not None:
-                continue
-            if tracker.preemption_pending and scheduled_tokens > 0:
-                tracker.preemption_pending = False
-            finalized_tokens = max(
-                scheduled_tokens - len(spec_tokens.get(request_id, ())),
-                0,
-            )
-            computed_tokens = computed_by_request.get(request_id, tracker.request.num_computed_tokens)
-            target_tokens = computed_tokens + finalized_tokens
-            if computed_tokens > tracker.issued_main_tokens:
-                raise ValueError(
-                    f"unexplained D2H issuance gap for {request_id!r}: "
-                    f"computed={computed_tokens}, issued={tracker.issued_main_tokens}"
-                )
-            if target_tokens <= tracker.issued_main_tokens:
-                continue
-            bound_blocks = cdiv(target_tokens, self._main_block_size)
-            if bound_blocks > tracker.main_reservation_block_count:
-                raise ValueError("Main bound prefix exceeds lifetime reservation")
-            if bound_blocks > len(tracker.main_block_ids):
-                raise ValueError("vLLM has not allocated enough Main Host blocks")
-            if bound_blocks < tracker.main_bound_block_count:
-                raise ValueError("Main bound prefix must not shrink within an execution epoch")
-            plan = DsaD2HStepPlan(
-                request_id=request_id,
-                execution_epoch=tracker.execution_epoch,
-                d2h_step_seq=tracker.next_d2h_step_seq,
-                main_reservation_id=tracker.reservation_id,
-                main_reservation_block_count=tracker.main_reservation_block_count,
-                main_bound_host_block_ids=tuple(tracker.main_block_ids[:bound_blocks]),
-                token_start=tracker.issued_main_tokens,
-                token_end=target_tokens,
-            )
-            validate_d2h_plan_capacity(plan, self._main_block_size)
-            plans.append((plan, computed_tokens))
-        return plans
+            tracker.command_emitted = True
+        return DsaConnectorMetadata(tuple(requests))
 
     def update_connector_output(self, connector_output: Any) -> None:
-        for request_id in connector_output.finished_recving or ():
-            tracker = self._dsa_requests.get(request_id)
-            if tracker is None or not tracker.terminal_pending:
-                continue
-            del self._dsa_requests[request_id]
-
         metadata = connector_output.kv_connector_worker_meta
         if metadata is None:
             return
         if not isinstance(metadata, DsaWorkerResultMetadata):
             raise TypeError("kv_connector_worker_meta must be DsaWorkerResultMetadata")
-
-        self._consume_d2h_progress(metadata.d2h_progress)
-
+        completed: list[str] = []
         for result in metadata.results:
             tracker = self._dsa_requests.get(result.request_id)
             if tracker is None:
-                logger.warning_once(
-                    "Ignoring DSA result for released request %r: result_identity=%s",
-                    result.request_id,
-                    (result.execution_epoch, result.command_seq),
-                )
+                logger.warning_once("Ignoring DSA result for released request %r", result.request_id)
                 continue
-            current_identity = (
-                tracker.execution_epoch,
-                tracker.command_seq,
-            )
-            result_identity = (result.execution_epoch, result.command_seq)
-            if result_identity < current_identity:
-                logger.warning_once(
-                    "Ignoring stale DSA result for request %r: current=%s, result=%s",
-                    result.request_id,
-                    current_identity,
-                    result_identity,
-                )
-                continue
-            if result_identity > current_identity:
-                raise ValueError(
-                    f"future DSA result for {result.request_id!r}: current={current_identity}, result={result_identity}"
-                )
             if result.tp_rank not in self._expected_tp_ranks:
                 raise ValueError(f"illegal Decode TP rank {result.tp_rank}")
-            existing = tracker.terminal_results.get(result.tp_rank)
+            existing = tracker.results_by_rank.get(result.tp_rank)
             if existing is not None:
                 if existing != result:
-                    raise ValueError(f"conflicting DSA local results for identity {result.identity}")
+                    raise ValueError(f"conflicting DSA result for {result.identity}")
                 continue
-            if tracker.active_action is None:
-                raise ValueError("result targets a completed DSA command")
-            validate_action_result(tracker.active_action, result)
-            tracker.terminal_results[result.tp_rank] = result
-
-        for request_id, tracker in self._dsa_requests.items():
-            if set(tracker.terminal_results) != self._expected_tp_ranks:
+            tracker.results_by_rank[result.tp_rank] = result
+            if set(tracker.results_by_rank) != self._expected_tp_ranks:
                 continue
-            if tracker.active_action is DsaAction.PREPARE_REPLAY:
-                if any(
-                    result.kind is not DsaLocalResultKind.REPLAY_READY for result in tracker.terminal_results.values()
-                ):
-                    raise RuntimeError("invalid exact-TP PREPARE_REPLAY outcome")
-                skipped_d2h_bytes = sum(result.skipped_d2h_bytes for result in tracker.terminal_results.values())
-                if tracker.confirmed_main_tokens == 0 and skipped_d2h_bytes:
-                    raise ValueError("transfer-failure replay must not report skipped D2H bytes")
-                logger.info(
-                    "blockwise_dsa_replay scope=decode_dp request_id=%s "
-                    "reservation_id=%s replay_tokens=%s reused_main_tokens=%s "
-                    "skipped_d2h_bytes=%s",
-                    request_id,
-                    tracker.reservation_id,
-                    tracker.request.num_tokens,
-                    tracker.confirmed_main_tokens,
-                    skipped_d2h_bytes,
-                )
+            if any(item.kind is DsaLocalResultKind.TRANSFER_FAILED for item in tracker.results_by_rank.values()):
                 tracker.request.num_computed_tokens = 0
-                tracker.active_action = None
-                finished = set(connector_output.finished_recving or ())
-                finished.add(request_id)
-                connector_output.finished_recving = finished
-                continue
-            if tracker.active_action is not DsaAction.RECEIVE_REMOTE:
-                continue
-            if any(result.kind is DsaLocalResultKind.TRANSFER_FAILED for result in tracker.terminal_results.values()):
-                tracker.command_seq += 1
-                tracker.active_action = DsaAction.PREPARE_REPLAY
-                tracker.command_emitted = False
-                tracker.issued_main_tokens = 0
-                tracker.confirmed_main_tokens = 0
-                # Replay recompute starts at token 0; shrink Main binding so the
-                # first D2H plan (chunked prefix) is a valid prefix extension.
-                tracker.main_bound_block_count = 0
-                tracker.next_d2h_step_seq = 0
-                tracker.d2h_ledger.clear()
-                tracker.num_computed_tokens = 0
-                tracker.num_external_tokens = 0
-                tracker.terminal_results.clear()
-                continue
-            tracker.issued_main_tokens = tracker.num_computed_tokens + tracker.num_external_tokens
-            tracker.confirmed_main_tokens = tracker.issued_main_tokens
-            tracker.active_action = None
+                logger.error(
+                    "Blockwise DSA receive failed for %s; falling back to local recompute",
+                    result.request_id,
+                )
+            completed.append(result.request_id)
+        if completed:
             finished = set(connector_output.finished_recving or ())
-            finished.add(request_id)
+            finished.update(completed)
             connector_output.finished_recving = finished
-
-    def _consume_d2h_progress(
-        self,
-        progress_values: tuple[D2HStepProgress, ...],
-    ) -> None:
-        touched_entries: set[tuple[str, int]] = set()
-        for progress in progress_values:
-            tracker = self._dsa_requests.get(progress.request_id)
-            if tracker is None:
-                logger.warning_once(
-                    "Ignoring D2H progress for released request %r: identity=%s",
-                    progress.request_id,
-                    progress.identity,
-                )
-                continue
-            if progress.execution_epoch < tracker.execution_epoch:
-                logger.warning_once(
-                    "Ignoring stale D2H progress for request %r: current_epoch=%s, progress=%s",
-                    progress.request_id,
-                    tracker.execution_epoch,
-                    progress.identity,
-                )
-                continue
-            if progress.execution_epoch > tracker.execution_epoch:
-                raise ValueError(f"future D2H progress for {progress.request_id!r}")
-            if progress.tp_rank not in self._expected_tp_ranks:
-                raise ValueError(f"illegal Decode TP rank {progress.tp_rank}")
-            entry = tracker.d2h_ledger.get(progress.d2h_step_seq)
-            if entry is None:
-                if progress.d2h_step_seq < tracker.next_d2h_step_seq:
-                    logger.warning_once(
-                        "Ignoring already confirmed D2H progress for request %r: identity=%s",
-                        progress.request_id,
-                        progress.identity,
-                    )
-                    continue
-                raise ValueError(f"future D2H progress for {progress.request_id!r}")
-            plan = entry.plan
-            if (
-                progress.main_reservation_id != plan.main_reservation_id
-                or progress.token_start != plan.token_start
-                or progress.token_end != plan.token_end
-            ):
-                raise ValueError(f"D2H progress does not match issued plan for {progress.request_id!r}")
-            existing = entry.progress_by_rank.get(progress.tp_rank)
-            if existing is not None:
-                if existing != progress:
-                    raise ValueError(f"conflicting D2H progress for identity {progress.identity}")
-                continue
-            entry.progress_by_rank[progress.tp_rank] = progress
-            touched_entries.add((progress.request_id, progress.d2h_step_seq))
-
-        for request_id, d2h_step_seq in touched_entries:
-            tracker = self._dsa_requests[request_id]
-            entry = tracker.d2h_ledger[d2h_step_seq]
-            if set(entry.progress_by_rank) != self._expected_tp_ranks:
-                raise ValueError(f"incomplete exact-TP D2H progress for {request_id!r} step {d2h_step_seq}")
-
-        while True:
-            advanced = False
-            for tracker in self._dsa_requests.values():
-                if not tracker.d2h_ledger:
-                    continue
-                if tracker.terminal_pending:
-                    completed = [
-                        step_seq
-                        for step_seq, issued in tracker.d2h_ledger.items()
-                        if set(issued.progress_by_rank) == self._expected_tp_ranks
-                    ]
-                    for step_seq in completed:
-                        del tracker.d2h_ledger[step_seq]
-                    advanced = advanced or bool(completed)
-                    continue
-                first_seq = min(tracker.d2h_ledger)
-                entry = tracker.d2h_ledger[first_seq]
-                if set(entry.progress_by_rank) != self._expected_tp_ranks:
-                    continue
-                if entry.plan.token_start != tracker.confirmed_main_tokens:
-                    raise ValueError(f"D2H ledger is not continuous for {entry.plan.request_id!r}")
-                tracker.confirmed_main_tokens = entry.plan.token_end
-                del tracker.d2h_ledger[first_seq]
-                advanced = True
-            if not advanced:
-                break
+            for request_id in completed:
+                self._dsa_requests.pop(request_id, None)
 
     def request_finished(
         self,
         request: "Request",
         block_ids: Any,
     ) -> tuple[bool, dict[str, Any] | None]:
-        tracker = self._dsa_requests.get(request.request_id)
-        if tracker is None:
-            return False, None
-        if not tracker.terminal_pending:
-            tracker.terminal_pending = True
-            tracker.awaiting_rebind = False
-            tracker.command_seq += 1
-            tracker.active_action = DsaAction.QUIESCE
-            tracker.command_emitted = False
-            tracker.terminal_results.clear()
-        return True, None
+        del block_ids
+        return request.request_id in self._dsa_requests, None
 
 
 class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
@@ -3311,23 +2980,6 @@ class MooncakeConnectorScheduler:
         self.set_xfer_handshake_metadata_from_workers(metadata)
 
 
-@dataclass(slots=True)
-class _DsaWorkerRequestState:
-    main_reservation_id: int
-    main_reservation_block_count: int
-    execution_epoch: int
-    main_bound_host_block_ids: tuple[int, ...]
-    indexer_hbm_block_ids: tuple[int, ...]
-    next_d2h_step_seq: int = 0
-    expected_d2h_token_start: int = 0
-    last_d2h_plan: DsaD2HStepPlan | None = None
-    in_flight: tuple[int, int, DsaAction] | None = None
-    pending_replay: DsaStepRequest | None = None
-    pending_quiesce: DsaStepRequest | None = None
-    finished_recving: bool = False
-    lock: Any = field(default_factory=threading.RLock, repr=False)
-
-
 class MooncakeConnectorWorker:
     """Implementation of Worker side methods"""
 
@@ -3423,20 +3075,9 @@ class MooncakeConnectorWorker:
         self._pending_runner_host_pool: DSAHostKVPool | None = None
         if self._dsa_decode:
             self._dsa_active_commands: dict[str, DsaStepRequest] = {}
-            self._dsa_request_states: dict[str, _DsaWorkerRequestState] = {}
-            self._dsa_finished_recving: queue.SimpleQueue[str] = queue.SimpleQueue()
-            self._dsa_reservation_id_upper_bound = 0
-            self._dsa_live_reservation_ids: frozenset[int] = frozenset()
-            self._dsa_current_step_plans: tuple[DsaD2HStepPlan, ...] = ()
-            self._dsa_pending_d2h: dict[tuple[str, int, int], DsaD2HStepPlan] = {}
-            self._dsa_progress_queued: set[tuple[str, int, int]] = set()
+            self._dsa_main_blocks_by_req: dict[str, int] = {}
             self._dsa_results: queue.SimpleQueue[DsaLocalResult] = queue.SimpleQueue()
-            self._dsa_progress: queue.SimpleQueue[D2HStepProgress] = queue.SimpleQueue()
             self._dsa_errors: queue.SimpleQueue[Exception] = queue.SimpleQueue()
-            main_group_idx, _ = infer_sfa_component_group_ids(kv_cache_config)
-            self._dsa_main_block_size = kv_cache_config.kv_cache_groups[
-                main_group_idx
-            ].kv_cache_spec.block_size
 
     def _get_prefill_decode_size(self, vllm_config: VllmConfig):
         # get prefill tp and dp size from extra config
@@ -3474,48 +3115,24 @@ class MooncakeConnectorWorker:
     def prepare_lru_resident_and_load(self, *args: Any, **kwargs: Any) -> bool:
         return False
 
-    def get_num_cpu_blocks(self, req_ids: list[str]) -> dict[str, int] | None:
+    def get_num_cpu_blocks(
+        self,
+        req_ids: list[str],
+    ) -> dict[str, int] | None:
         result = {
-            req_id: len(state.main_bound_host_block_ids)
-            for req_id in req_ids
-            if (state := self._dsa_request_states.get(req_id)) is not None and state.main_bound_host_block_ids
+            request_id: self._dsa_main_blocks_by_req[request_id]
+            for request_id in req_ids
+            if request_id in self._dsa_main_blocks_by_req
         }
         return result or None
 
     def save_current_kv_tokens(self, *args: Any) -> None:
+        # Decode-produced Main KV is written by KVOffloadDecodeManager.
         return
 
     def wait_for_save(self) -> None:
-        pending = tuple(self._dsa_pending_d2h[identity] for identity in sorted(self._dsa_pending_d2h))
-        for plan in pending:
-            if plan.identity in self._dsa_progress_queued:
-                continue
-            self._dsa_progress.put(
-                D2HStepProgress(
-                    request_id=plan.request_id,
-                    execution_epoch=plan.execution_epoch,
-                    d2h_step_seq=plan.d2h_step_seq,
-                    main_reservation_id=plan.main_reservation_id,
-                    token_start=plan.token_start,
-                    token_end=plan.token_end,
-                    tp_rank=self.tp_rank,
-                )
-            )
-            self._dsa_progress_queued.add(plan.identity)
-        pending_quiesce = tuple(
-            (request_id, state)
-            for request_id, state in self._dsa_request_states.items()
-            if state.pending_quiesce is not None
-        )
-        for request_id, state in pending_quiesce:
-            self._finish_dsa_quiesce(request_id, state)
-        pending_replay = tuple(
-            (request_id, state)
-            for request_id, state in self._dsa_request_states.items()
-            if state.pending_replay is not None
-        )
-        for request_id, state in pending_replay:
-            self._finish_dsa_replay(request_id, state)
+        # The PD connector does not own Decode-time Main KV writes.
+        return
 
     @staticmethod
     def _serialize_kv_group_spec(
@@ -4127,12 +3744,10 @@ class MooncakeConnectorWorker:
             if self.kv_role == "kv_consumer"
             else set()
         )
-        if self._dsa_decode:
-            while True:
-                try:
-                    done_recving.add(self._dsa_finished_recving.get_nowait())
-                except queue.Empty:
-                    break
+        if self._dsa_decode and finished_req_ids:
+            for request_id in finished_req_ids:
+                self._dsa_main_blocks_by_req.pop(request_id, None)
+                self._dsa_active_commands.pop(request_id, None)
         if self.tp_rank == 0:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
@@ -5141,414 +4756,74 @@ class MooncakeConnectorWorker:
             for req_id, delay_start_time in metadata.requests_to_send.items():
                 self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
 
-    def _accept_dsa_reservation_snapshot(
+    def _start_dsa_commands(
         self,
         metadata: DsaConnectorMetadata,
     ) -> None:
-        old_upper_bound = self._dsa_reservation_id_upper_bound
-        old_live_ids = self._dsa_live_reservation_ids
-        new_upper_bound = metadata.reservation_id_upper_bound
-        new_live_ids = frozenset(metadata.live_reservation_ids)
-        if new_upper_bound < old_upper_bound:
-            raise ValueError("DSA reservation upper bound must not roll back")
-        if any(
-            reservation_id < old_upper_bound and reservation_id not in old_live_ids for reservation_id in new_live_ids
-        ):
-            raise ValueError("retired DSA reservation must not resurrect")
-
-        retired_requests: list[str] = []
-        for request_id, state in self._dsa_request_states.items():
-            if state.main_reservation_id in new_live_ids:
-                continue
-            has_pending_d2h = any(identity[0] == request_id for identity in self._dsa_pending_d2h)
-            if (
-                state.in_flight is not None
-                or state.pending_replay is not None
-                or state.pending_quiesce is not None
-                or has_pending_d2h
-            ):
-                raise ValueError(f"cannot retire non-Quiesced DSA reservation for {request_id!r}")
-            retired_requests.append(request_id)
-
-        for request_id in retired_requests:
-            self._dsa_active_commands.pop(request_id, None)
-            self._dsa_request_states.pop(request_id)
-        self._dsa_reservation_id_upper_bound = new_upper_bound
-        self._dsa_live_reservation_ids = new_live_ids
-
-    def _start_dsa_commands(self, metadata: DsaConnectorMetadata) -> None:
-        self._accept_dsa_reservation_snapshot(metadata)
         self._dispatch_dsa_commands(metadata.requests)
-        accepted_plans: list[DsaD2HStepPlan] = []
-        for plan in metadata.d2h_plans:
-            if self._accept_dsa_plan(plan):
-                accepted_plans.append(plan)
-        self._dsa_current_step_plans = tuple(accepted_plans)
 
     def _dispatch_dsa_commands(
         self,
         commands: tuple[DsaStepRequest, ...],
     ) -> None:
         for command in commands:
-            validate_bound_main_capacity(command, self._dsa_main_block_size)
-            reservation_id = command.destination.main_reservation_id
-            state = self._dsa_request_states.get(command.request_id)
-            if state is None:
-                destination = command.destination
-                initial_boundary = (
-                    command.lifecycle.num_computed_tokens + command.lifecycle.num_external_tokens
-                    if command.lifecycle.action is DsaAction.RECEIVE_REMOTE
-                    else command.lifecycle.preserved_main_tokens
-                )
-                state = _DsaWorkerRequestState(
-                    main_reservation_id=reservation_id,
-                    main_reservation_block_count=(destination.main_reservation_block_count),
-                    execution_epoch=command.lifecycle.execution_epoch,
-                    main_bound_host_block_ids=(destination.main_bound_host_block_ids),
-                    indexer_hbm_block_ids=(destination.indexer_hbm_block_ids),
-                    expected_d2h_token_start=initial_boundary,
-                )
-                self._dsa_request_states[command.request_id] = state
-            elif state.main_reservation_id != reservation_id:
-                raise ValueError(f"conflicting DSA request-ID incarnation for {command.request_id!r}")
             existing = self._dsa_active_commands.get(command.request_id)
-            command_identity = (
-                command.lifecycle.execution_epoch,
-                command.lifecycle.command_seq,
-            )
             if existing is not None:
-                existing_identity = (
-                    existing.lifecycle.execution_epoch,
-                    existing.lifecycle.command_seq,
-                )
-                if command_identity < existing_identity:
-                    continue
-                if command_identity == existing_identity:
-                    if command != existing:
-                        raise ValueError(
-                            f"conflicting DSA worker command for identity {command.request_id, *command_identity}"
-                        )
-                    continue
-                previous, current = existing.destination, command.destination
-                if command.lifecycle.action is DsaAction.PREPARE_REPLAY:
-                    # Replay may shrink Main binding to the preserved prefix
-                    # (empty after transfer-failure recompute).
-                    ownership_stable = (
-                        previous.main_reservation_id == current.main_reservation_id
-                        and previous.main_reservation_block_count == current.main_reservation_block_count
-                    )
-                else:
-                    ownership_stable = (
-                        previous.main_reservation_id == current.main_reservation_id
-                        and previous.main_reservation_block_count == current.main_reservation_block_count
-                        and current.main_bound_host_block_ids[: len(previous.main_bound_host_block_ids)]
-                        == previous.main_bound_host_block_ids
-                    )
-                if not ownership_stable:
-                    raise ValueError(f"DSA destination ownership changed for {command.request_id!r}")
-            destination = command.destination
-            with state.lock:
-                pending_replay = state.pending_replay
-                if pending_replay is not None:
-                    pending_identity = (
-                        pending_replay.lifecycle.execution_epoch,
-                        pending_replay.lifecycle.command_seq,
-                    )
-                    if command_identity < pending_identity:
-                        continue
-                    if command_identity == pending_identity:
-                        if command != pending_replay:
-                            raise ValueError(
-                                f"conflicting pending DSA replay for identity {command.request_id, *command_identity}"
-                            )
-                        continue
-                    if command.lifecycle.action is not DsaAction.QUIESCE:
-                        raise ValueError(
-                            f"DSA worker command arrived while replay is pending for {command.request_id!r}"
-                        )
-                    state.pending_replay = None
-                if state.pending_quiesce is not None and command.lifecycle.action is not DsaAction.QUIESCE:
-                    raise ValueError(f"DSA worker command arrived after QUIESCE for {command.request_id!r}")
-                if state.in_flight is not None and command.lifecycle.action is not DsaAction.QUIESCE:
+                if existing != command:
                     raise ValueError(
-                        "newer DSA worker command overlaps an in-flight operation: "
-                        f"request={command.request_id!r}, old={state.in_flight}, "
-                        f"new={(*command_identity, command.lifecycle.action)}"
+                        "conflicting blockwise DSA receive for "
+                        f"{command.request_id!r}"
                     )
-            if destination.main_reservation_block_count != state.main_reservation_block_count:
-                raise ValueError(f"DSA reservation capacity changed for {command.request_id!r}")
-            if command.lifecycle.execution_epoch < state.execution_epoch:
                 continue
-            if command.lifecycle.execution_epoch > state.execution_epoch:
-                if command.lifecycle.action not in (DsaAction.PREPARE_REPLAY, DsaAction.QUIESCE):
-                    raise ValueError(f"future DSA worker epoch for {command.request_id!r}")
-            if command.lifecycle.action is DsaAction.PREPARE_REPLAY:
-                with state.lock:
-                    pending_d2h = tuple(
-                        identity for identity in self._dsa_pending_d2h if identity[0] == command.request_id
-                    )
-                    if any(identity not in self._dsa_progress_queued for identity in pending_d2h):
-                        state.pending_replay = command
-                        continue
-            if command.lifecycle.execution_epoch > state.execution_epoch:
-                state.execution_epoch = command.lifecycle.execution_epoch
-                state.main_bound_host_block_ids = destination.main_bound_host_block_ids
-                state.indexer_hbm_block_ids = destination.indexer_hbm_block_ids
-                state.next_d2h_step_seq = 0
-                state.expected_d2h_token_start = command.lifecycle.preserved_main_tokens
-                state.last_d2h_plan = None
-            elif command.lifecycle.action is DsaAction.PREPARE_REPLAY:
-                # Transfer-failure replay may shrink Main binding back to the
-                # preserved prefix (often empty); do not require prefix growth.
-                state.main_bound_host_block_ids = destination.main_bound_host_block_ids
-                state.indexer_hbm_block_ids = destination.indexer_hbm_block_ids
-            elif (
-                destination.main_bound_host_block_ids[: len(state.main_bound_host_block_ids)]
-                != state.main_bound_host_block_ids
-            ):
-                raise ValueError(f"DSA Main binding is not a prefix extension for {command.request_id!r}")
-            else:
-                state.main_bound_host_block_ids = destination.main_bound_host_block_ids
-                state.indexer_hbm_block_ids = destination.indexer_hbm_block_ids
-            if command.lifecycle.action is DsaAction.PREPARE_REPLAY:
-                state.next_d2h_step_seq = 0
-                state.expected_d2h_token_start = command.lifecycle.preserved_main_tokens
-                state.last_d2h_plan = None
-            remote_endpoint = None
-            if command.lifecycle.action is DsaAction.RECEIVE_REMOTE:
-                assert command.source is not None
-                assert self.kv_recv_thread is not None
-                leader_rank = self.tp_rank * (self._prefill_tp_size // self._decode_tp_size)
-                if len(command.source.endpoints_by_prefill_rank) != self._prefill_tp_size:
-                    raise ValueError(f"DSA endpoint tuple must contain {self._prefill_tp_size} Prefill ranks")
-                remote_endpoint = command.source.endpoints_by_prefill_rank[leader_rank]
-            with state.lock:
-                if state.pending_quiesce is not None and command.lifecycle.action is not DsaAction.QUIESCE:
-                    raise ValueError(f"DSA worker command arrived after QUIESCE for {command.request_id!r}")
-                if state.in_flight is not None and command.lifecycle.action is not DsaAction.QUIESCE:
-                    raise ValueError(
-                        "newer DSA worker command overlaps an in-flight operation: "
-                        f"request={command.request_id!r}, old={state.in_flight}, "
-                        f"new={(*command_identity, command.lifecycle.action)}"
-                    )
-                if command.lifecycle.action is DsaAction.QUIESCE:
-                    state.pending_quiesce = command
-                self._dsa_active_commands[command.request_id] = command
-                if command.lifecycle.action in (DsaAction.RECEIVE_REMOTE,):
-                    state.in_flight = (
-                        command.lifecycle.execution_epoch,
-                        command.lifecycle.command_seq,
-                        command.lifecycle.action,
-                    )
-            if command.lifecycle.action is DsaAction.RECEIVE_REMOTE:
-                assert self.kv_recv_thread is not None
-                assert remote_endpoint is not None
-                self.kv_recv_thread.add_dsa_request(
-                    command,
-                    remote_endpoint,
-                    lambda result, request=command, request_state=state: self._finish_dsa_operation(
-                        request_state, request, result
-                    ),
-                    lambda request=command: self._is_dsa_cancelled(request),
-                    self._dsa_errors.put,
+            source = command.source
+            leader_rank = self.tp_rank * (
+                self._prefill_tp_size // self._decode_tp_size
+            )
+            if len(source.endpoints_by_prefill_rank) != self._prefill_tp_size:
+                raise ValueError(
+                    "DSA endpoint tuple must contain "
+                    f"{self._prefill_tp_size} Prefill ranks"
                 )
-                continue
-            if command.lifecycle.action is DsaAction.PREPARE_REPLAY:
-                self._dsa_results.put(
-                    DsaLocalResult(
-                        request_id=command.request_id,
-                        execution_epoch=command.lifecycle.execution_epoch,
-                        command_seq=command.lifecycle.command_seq,
-                        tp_rank=self.tp_rank,
-                        kind=DsaLocalResultKind.REPLAY_READY,
-                        skipped_d2h_bytes=self._dsa_skipped_d2h_bytes(command),
-                    )
-                )
-                continue
-            if command.lifecycle.action is DsaAction.QUIESCE:
-                self._finish_dsa_quiesce(command.request_id, state)
-                continue
-            raise NotImplementedError(f"DSA worker action is not wired yet: {command.lifecycle.action.name}")
-
-    def _accept_dsa_plan(self, plan: DsaD2HStepPlan) -> bool:
-        validate_d2h_plan_capacity(plan, self._dsa_main_block_size)
-        state = self._dsa_request_states.get(plan.request_id)
-        if state is None:
-            raise ValueError(f"D2H plan cannot create request binding for {plan.request_id!r}")
-        if plan.main_reservation_id != state.main_reservation_id:
-            raise ValueError(f"D2H plan reservation mismatch for {plan.request_id!r}")
-        if plan.main_reservation_block_count != state.main_reservation_block_count:
-            raise ValueError(f"D2H plan reservation capacity mismatch for {plan.request_id!r}")
-        if plan.execution_epoch < state.execution_epoch:
-            logger.warning_once(
-                "Ignoring stale D2H plan for request %r: worker_epoch=%s, plan=%s",
-                plan.request_id,
-                state.execution_epoch,
-                plan.identity,
+            remote_endpoint = source.endpoints_by_prefill_rank[leader_rank]
+            self._dsa_main_blocks_by_req[command.request_id] = len(
+                command.main_host_block_ids
             )
-            return False
-        if plan.execution_epoch > state.execution_epoch:
-            raise ValueError(f"future D2H plan for {plan.request_id!r}")
-        if plan.d2h_step_seq < state.next_d2h_step_seq:
-            if state.last_d2h_plan == plan:
-                return False
-            raise ValueError(f"conflicting duplicate D2H plan for {plan.request_id!r}")
-        if plan.d2h_step_seq > state.next_d2h_step_seq:
-            raise ValueError(f"D2H plan sequence gap for {plan.request_id!r}")
-        if plan.token_start != state.expected_d2h_token_start:
-            raise ValueError(f"D2H plan token range gap for {plan.request_id!r}")
-        if plan.main_bound_host_block_ids[: len(state.main_bound_host_block_ids)] != state.main_bound_host_block_ids:
-            raise ValueError(f"D2H plan Main binding is not a prefix extension for {plan.request_id!r}")
-        state.main_bound_host_block_ids = plan.main_bound_host_block_ids
-        state.next_d2h_step_seq += 1
-        state.expected_d2h_token_start = plan.token_end
-        state.last_d2h_plan = plan
-        self._dsa_pending_d2h[plan.identity] = plan
-        return True
-
-    def _rebuild_dsa_sfa_view(self, req_ids: list[str]) -> None:
-        del req_ids
-
-    def _dsa_skipped_d2h_bytes(self, command: DsaStepRequest) -> int:
-        preserved_tokens = command.lifecycle.preserved_main_tokens
-        if preserved_tokens == 0:
-            return 0
-        pool = self._pending_runner_host_pool
-        if pool is None:
-            raise RuntimeError("Blockwise DSA Decode Host pool is not bound")
-        if not pool.is_owner:
-            return 0
-        if self.decode_manager is None:
-            raise RuntimeError("Blockwise DSA Decode manager is not registered")
-        registered_layers = self.decode_manager.offload_layer_names
-        if not registered_layers:
-            raise RuntimeError("Blockwise DSA skipped D2H bytes require completed SFA registration")
-        return (
-            preserved_tokens
-            * len(registered_layers)
-            * (
-                self.decode_manager.token_size_bytes_k
-                + self.decode_manager.token_size_bytes_v
-            )
-        )
-
-    def _is_dsa_cancelled(self, command: DsaStepRequest) -> bool:
-        state = self._dsa_request_states.get(command.request_id)
-        if state is None:
-            return False
-        with state.lock:
-            return bool(
-                state.pending_quiesce is not None
-                and state.pending_quiesce.lifecycle.execution_epoch >= command.lifecycle.execution_epoch
+            self._dsa_active_commands[command.request_id] = command
+            assert self.kv_recv_thread is not None
+            self.kv_recv_thread.add_dsa_request(
+                command,
+                remote_endpoint,
+                lambda result, request=command: self._finish_dsa_receive(
+                    request, result
+                ),
+                None,
+                self._dsa_errors.put,
             )
 
-    def _finish_dsa_operation(
+    def _finish_dsa_receive(
         self,
-        state: _DsaWorkerRequestState,
         command: DsaStepRequest,
         result: DsaLocalResult | None,
     ) -> None:
-        identity = (
-            command.lifecycle.execution_epoch,
-            command.lifecycle.command_seq,
-            command.lifecycle.action,
-        )
-        finish_quiesce = False
-        record_result = False
-        with state.lock:
-            if self._dsa_request_states.get(command.request_id) is not state:
-                return
-            if state.main_reservation_id != command.destination.main_reservation_id:
-                return
-            if state.in_flight != identity:
-                return
-            state.in_flight = None
-            finish_quiesce = state.pending_quiesce is not None
-            record_result = not finish_quiesce and result is not None
-        if finish_quiesce:
-            self._finish_dsa_quiesce(command.request_id, state)
-        elif record_result:
-            assert result is not None
-            self._record_dsa_result(command, result)
-
-    def _finish_dsa_quiesce(self, request_id: str, state: _DsaWorkerRequestState) -> None:
-        with state.lock:
-            command = state.pending_quiesce
-            if command is None or state.in_flight is not None:
-                return
-            pending_d2h = tuple(identity for identity in self._dsa_pending_d2h if identity[0] == request_id)
-            if any(identity not in self._dsa_progress_queued for identity in pending_d2h):
-                return
-            for identity in pending_d2h:
-                self._dsa_pending_d2h.pop(identity, None)
-                self._dsa_progress_queued.discard(identity)
-            state.pending_quiesce = None
-            if state.finished_recving:
-                return
-            state.finished_recving = True
-            state.main_bound_host_block_ids = ()
-            state.indexer_hbm_block_ids = ()
-            state.last_d2h_plan = None
-            self._dsa_active_commands.pop(request_id, None)
-        self._dsa_finished_recving.put(request_id)
-
-    def _finish_dsa_replay(self, request_id: str, state: _DsaWorkerRequestState) -> None:
-        with state.lock:
-            command = state.pending_replay
-            if command is None or state.in_flight is not None:
-                return
-            pending_d2h = tuple(identity for identity in self._dsa_pending_d2h if identity[0] == request_id)
-            if any(identity not in self._dsa_progress_queued for identity in pending_d2h):
-                return
-            state.pending_replay = None
-        self._dispatch_dsa_commands((command,))
-
-    def _record_dsa_result(
-        self,
-        command: DsaStepRequest,
-        result: DsaLocalResult,
-    ) -> None:
-        command_identity = (
-            command.lifecycle.execution_epoch,
-            command.lifecycle.command_seq,
-        )
-        result_identity = (result.execution_epoch, result.command_seq)
-        if result_identity < command_identity:
+        existing = self._dsa_active_commands.get(command.request_id)
+        if existing != command:
             return
-        if result_identity > command_identity:
-            raise ValueError(f"future DSA worker result for {result.request_id!r}")
-        if result.tp_rank != self.tp_rank:
-            raise ValueError(f"DSA worker result rank {result.tp_rank} does not match local rank {self.tp_rank}")
-        validate_action_result(command.lifecycle.action, result)
-        self._dsa_results.put(result)
+        self._dsa_active_commands.pop(command.request_id, None)
+        if result is not None:
+            self._dsa_results.put(result)
 
     def build_connector_worker_meta(
         self,
     ) -> DsaWorkerResultMetadata | None:
         results: list[DsaLocalResult] = []
-        progress_values: list[D2HStepProgress] = []
         while True:
             try:
                 results.append(self._dsa_results.get_nowait())
             except queue.Empty:
                 break
-        while True:
-            try:
-                progress_values.append(self._dsa_progress.get_nowait())
-            except queue.Empty:
-                break
-        if not results and not progress_values:
+        if not results:
             return None
-        metadata = DsaWorkerResultMetadata(tuple(results), tuple(progress_values))
-        for progress in progress_values:
-            identity = (
-                progress.request_id,
-                progress.execution_epoch,
-                progress.d2h_step_seq,
-            )
-            self._dsa_pending_d2h.pop(identity, None)
-            self._dsa_progress_queued.discard(identity)
-        return metadata
+        return DsaWorkerResultMetadata(tuple(results))
 
     def _get_tp_num_need_pulls(self, prefill_tp_size: int | None) -> int:
         if prefill_tp_size is None:

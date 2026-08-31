@@ -599,22 +599,23 @@ class KVOffloadDecodeManager:
             membership_map = region.tensor.view(shape)
             planner_map = None
             if self.tp_rank == 0:
+                plan_width = (
+                    self.topk
+                    + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT
+                )
+                plan_shape = [row_capacity, plan_width]
                 planner_map = torch.empty(
-                    shape,
+                    plan_shape,
                     dtype=torch.int16,
                     device="cpu",
                     pin_memory=True,
                 )
                 self.fused_overlap_membership_plan_device_staging = torch.empty(
-                    [
-                        row_capacity,
-                        self.topk
-                        + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT,
-                    ],
+                    plan_shape,
                     dtype=torch.int16,
                     device=membership_map.device,
                 )
-                self._init_fused_overlap_membership_control(planner_map)
+                self._init_fused_overlap_plan_staging(planner_map)
                 self._init_fused_overlap_membership_control(membership_map)
                 torch_npu.npu.current_stream().synchronize()
             self.tp_group.barrier()
@@ -685,6 +686,22 @@ class KVOffloadDecodeManager:
             FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT:
             FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT
             + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT,
+        ]
+        control[:, 1] = FSA_EXTERNAL_PLAN_READY_MARKER
+        control[:, 2] = self.topk
+        control[:, 3] = (
+            FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT - self.topk
+        )
+        control[:, 7] = FSA_PAIRED_SELECTION_COPY_MARKER
+
+    def _init_fused_overlap_plan_staging(
+        self,
+        plan_staging: torch.Tensor,
+    ) -> None:
+        plan_staging.fill_(-1)
+        control = plan_staging[
+            :,
+            self.topk : self.topk + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT,
         ]
         control[:, 1] = FSA_EXTERNAL_PLAN_READY_MARKER
         control[:, 2] = self.topk
@@ -1601,19 +1618,51 @@ class KVOffloadDecodeManager:
             )
 
         layer_id = self._get_offload_layer_id(layer_name)
-        plan_start = FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT - self.topk
+        plan_start = (
+            FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT - self.topk
+        )
+        plan_width = required_columns - plan_start
         plan_storage = selection_membership_map[
             :num_tokens,
             plan_start:required_columns,
         ]
         planner_membership_map = self.fused_overlap_planner_membership_map
-        if planner_membership_map is None:
+        planner_plan_start = plan_start
+        if self.tp_rank == 0:
+            if planner_membership_map is None:
+                planner_membership_map = selection_membership_map
+            elif self.uses_mooncake_host:
+                planner_plan_start = 0
+            if (
+                planner_membership_map.dim() != 2
+                or planner_membership_map.shape[0] < num_tokens
+                or planner_membership_map.shape[1]
+                < planner_plan_start + plan_width
+                or planner_membership_map.dtype != torch.int16
+                or planner_membership_map.device.type != "cpu"
+            ):
+                raise ValueError(
+                    "external FSA planner requires CPU int16 membership storage: "
+                    f"shape={tuple(planner_membership_map.shape)}, "
+                    f"dtype={planner_membership_map.dtype}, "
+                    f"device={planner_membership_map.device}"
+                )
+            planner_storage = planner_membership_map[
+                :num_tokens,
+                planner_plan_start : planner_plan_start + plan_width,
+            ]
+            if self.uses_mooncake_host and not planner_storage.is_contiguous():
+                raise RuntimeError(
+                    "Mooncake external FSA planner staging must be compact and "
+                    "contiguous"
+                )
+            encoded_plan_stride = planner_membership_map.stride(0)
+        else:
+            # Only TP0 runs the CPU planner. Other TP ranks consume the plan
+            # published through the operator membership map after broadcast.
             planner_membership_map = selection_membership_map
-        planner_storage = planner_membership_map[
-            :num_tokens,
-            plan_start:required_columns,
-        ]
-        encoded_plan_stride = planner_membership_map.stride(0)
+            planner_storage = plan_storage
+            encoded_plan_stride = selection_membership_map.stride(0)
         external_plan_debug = os.getenv("VLLM_ASCEND_SFA_DEBUG", "0") == "1"
         if external_plan_debug:
             logger.info(

@@ -71,7 +71,7 @@ handshake_port = base + rank_offset
 
 `zmq_ctx(ROUTER, ...)` 最终调用 socket bind；失败后线程退出，注册调用方抛出
 `KV Cache sending/receiving thread failed to start`。后者是汇总错误，不是第二个独立根因。
-这个握手端口与 `TransferEngine.get_rpc_port()` 返回的 TE RPC 端口也不是同一概念。
+这个握手端口与 `TransferEngine.get_rpc_port()` 返回的 TransferEngine RPC 端口也不是同一概念。
 
 **公式不含 `num_speculative_tokens`，没有“每一个 MTP 步骤新占一个握手端口”的实现。**
 所以 issue 009 的“MTP 多端口更易撞”应撤回；MTP 开启触发了重启，不等于它本身增加端口数。

@@ -69,9 +69,6 @@ from vllm_ascend.distributed.kv_transfer.kv_offload_decode.host_pool import (
 from vllm_ascend.distributed.kv_transfer.kv_offload_decode.kv_offload_decode_manager import (
     get_kv_offload_decode_manager,
 )
-from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
-    infer_sfa_component_group_ids,
-)
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.scheduler import (
     SFAPDCpuOffloadScheduler,
 )
@@ -88,6 +85,14 @@ from vllm_ascend.distributed.utils import (
 )
 from vllm_ascend.utils import enable_custom_op, enable_sfa_dcp_replicated_indexer
 
+from .mooncake_dsa_layout import (
+    DsaCacheLayout,
+    add_dsa_cache_descriptor,
+    dsa_cache_key,
+    infer_dsa_block_group_ids,
+    project_dsa_remote_arrays,
+    select_dsa_block_groups,
+)
 from .mooncake_dsa_metadata import (
     DsaConnectorMetadata,
     DsaLocalResult,
@@ -272,6 +277,9 @@ class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     block_strides: list[list[int]]
     local_ip: str = ""
     handshake_port: int = 0
+    # Optional extension: cache identity -> (wire row, first position, count).
+    # Existing address arrays and non-DSA readers retain their wire format.
+    dsa_cache_layout: DsaCacheLayout | None = None
 
 
 @dataclass
@@ -690,6 +698,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.remote_block_stride_per_addr: dict[str, dict[int, list[list[int]]]] = SizedDict()
         self.remote_block_len_per_addr: dict[str, dict[int, list[list[int]]]] = SizedDict()
         self.remote_kv_group2layeridx: dict[str, dict[int, dict[int, tuple[dict[str, Any], list[int]]]]] = SizedDict()
+        self.remote_dsa_cache_layout: dict[str, dict[int, DsaCacheLayout | None]] = SizedDict()
         self.remote_metadata_lock = threading.Lock()
         self._dsa_indexer_debug_tensors: list[list[torch.Tensor]] = []
         self._dsa_main_debug_tensors: list[list[torch.Tensor]] = []
@@ -863,10 +872,9 @@ class KVCacheRecvingThread(threading.Thread):
                 len(remote_base_addrs[layer_idx]) if layer_idx < len(remote_base_addrs) else 0
             )
             for position, base, block_len, stride, local_scale in layer_layout:
-                # GLM-5.2 Prefill shared-indexer layers publish Main K/V only
-                # (handshake len=2). Decode still has local Indexer slots at
-                # OFFLOAD_INDEXER_* (>=2); skip those SG entries (F-CODE-013).
-                if position >= remote_n:
+                # Projection leaves an empty row only for an optional shared
+                # target Indexer. Never skip a partially described cache.
+                if remote_n == 0 and allow_empty:
                     continue
                 try:
                     remote_base = remote_base_addrs[layer_idx][position]
@@ -909,7 +917,12 @@ class KVCacheRecvingThread(threading.Thread):
                             f"layer={layer_idx} position={position}"
                         )
                     max_src = len(destination_block_ids) * token_scale
-                    n = min(len(source_physical), max_src)
+                    n = len(source_physical)
+                    if n > max_src:
+                        raise ValueError(
+                            "DSA Indexer destination cannot cover all source pages: "
+                            f"n_src={n} capacity={max_src} layer={layer_idx} position={position}"
+                        )
                     if n <= 0:
                         raise ValueError(
                             "DSA Indexer page packing produced empty transfer: "
@@ -918,7 +931,7 @@ class KVCacheRecvingThread(threading.Thread):
                         )
                     for i in range(n):
                         source_id = source_physical[i]
-                        mgr_id = destination_block_ids[min(i // token_scale, len(destination_block_ids) - 1)]
+                        mgr_id = destination_block_ids[i // token_scale]
                         page_slot = i % token_scale
                         local_addresses.append(base + mgr_id * block_len + page_slot * remote_len)
                         remote_addresses.append(remote_base + source_id * remote_len)
@@ -1120,6 +1133,25 @@ class KVCacheRecvingThread(threading.Thread):
                 remote_scales = self.remote_block_size_scale[remote_engine_id][remote_handshake_port]
                 remote_lens = self.remote_block_len_per_addr[remote_engine_id][remote_handshake_port]
                 remote_te_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
+                remote_cache_layout = self.remote_dsa_cache_layout.get(remote_engine_id, {}).get(remote_handshake_port)
+            remote_arrays = (remote_base_addrs, remote_strides, remote_scales, remote_lens)
+            # Validate both components before reading any source buffer. A
+            # missing MTP Main must fail even when all target caches exist.
+            indexer_arrays = project_dsa_remote_arrays(
+                self._dsa_indexer_local_layout,
+                self._dsa_indexer_cache_keys,
+                remote_cache_layout,
+                remote_arrays,
+                num_target_layers=self.num_layers,
+            )
+            main_arrays = project_dsa_remote_arrays(
+                self._dsa_main_local_layout,
+                self._dsa_main_cache_keys,
+                remote_cache_layout,
+                remote_arrays,
+                num_target_layers=self.num_layers,
+            )
+            remote_base_addrs, remote_strides, remote_scales, remote_lens = indexer_arrays
             session_id = f"{remote_host}:{remote_te_port}"
             if is_cancelled is None or not is_cancelled():
                 indexer_lists = self._build_dsa_transfer_lists(
@@ -1170,6 +1202,7 @@ class KVCacheRecvingThread(threading.Thread):
                         remote_scales=remote_scales,
                         remote_lens=remote_lens,
                     )
+                    remote_base_addrs, remote_strides, remote_scales, remote_lens = main_arrays
                     if getattr(self, "_dsa_main_owner", True):
                         main_lists = self._build_dsa_transfer_lists(
                             self._dsa_main_local_layout,
@@ -2022,6 +2055,7 @@ class KVCacheRecvingThread(threading.Thread):
                 )
             with self.remote_metadata_lock:
                 self.remote_kv_group2layeridx[engine_id][remote_handshake_port] = agent_meta.kv_group2layeridx
+                self.remote_dsa_cache_layout[engine_id][remote_handshake_port] = agent_meta.dsa_cache_layout
                 self.kv_caches_base_addr[engine_id][remote_handshake_port] = agent_meta.kv_caches_base_addr
                 self.remote_te_port[engine_id][remote_handshake_port] = agent_meta.te_rpc_port
                 self.remote_block_size_scale[engine_id][remote_handshake_port] = agent_meta.block_size_scale
@@ -2194,8 +2228,7 @@ class _MooncakeDsaDecodeScheduler(SFAPDCpuOffloadScheduler):
         remote_groups = tuple(
             tuple(group) for group in params["remote_block_ids"]
         )
-        if not remote_groups:
-            raise ValueError("remote_block_ids must contain at least one group")
+        main_block_ids, indexer_block_ids = select_dsa_block_groups(remote_groups, params.get("dsa_block_group_ids"))
         source = RemoteSource(
             remote_request_id=params["remote_request_id"],
             endpoints_by_prefill_rank=_project_remote_endpoints(
@@ -2207,8 +2240,8 @@ class _MooncakeDsaDecodeScheduler(SFAPDCpuOffloadScheduler):
                 ),
                 prefill_tp_size=self._dsa_prefill_tp_size,
             ),
-            indexer_block_ids=remote_groups[0],
-            main_block_ids=remote_groups[0] if len(remote_groups) == 1 else remote_groups[-1],
+            indexer_block_ids=indexer_block_ids,
+            main_block_ids=main_block_ids,
         )
         self._dsa_requests[request.request_id] = _DsaSchedulerRequest(
             request=request,
@@ -2651,13 +2684,10 @@ class MooncakeConnectorScheduler:
         self.kv_cache_groups = kv_cache_config.kv_cache_groups
         self._dsa_main_group_idx: int | None = None
         self._dsa_indexer_group_idx: int | None = None
-        if (
-            ascend_envs.VLLM_ASCEND_SFA_DEBUG
-            and vllm_config.kv_transfer_config.get_from_extra_config("dsa_pd_offload", False)
-        ):
-            self._dsa_main_group_idx, self._dsa_indexer_group_idx = infer_sfa_component_group_ids(
-                kv_cache_config
-            )
+        if vllm_config.kv_transfer_config.get_from_extra_config("dsa_pd_offload", False):
+            group_ids = infer_dsa_block_group_ids([group.layer_names for group in self.kv_cache_groups])
+            self._dsa_main_group_idx = group_ids["main"]
+            self._dsa_indexer_group_idx = group_ids["indexer"]
         self.use_hybrid = (
             not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
             and any(not isinstance(g.kv_cache_spec, FullAttentionSpec) for g in kv_cache_config.kv_cache_groups)
@@ -2904,13 +2934,17 @@ class MooncakeConnectorScheduler:
         if delay_free_blocks:
             logger.info("Delaying free of %d blocks for request %s", sum(computed_block_lens), request.request_id)
             self._reqs_need_send[request.request_id] = time.time()
-            if self._dsa_main_group_idx is not None and self._dsa_indexer_group_idx is not None:
+            if (
+                ascend_envs.VLLM_ASCEND_SFA_DEBUG
+                and self._dsa_main_group_idx is not None
+                and self._dsa_indexer_group_idx is not None
+            ):
                 self._dsa_debug_source_blocks[request.request_id] = (
                     list(computed_block_ids[self._dsa_indexer_group_idx]),
                     list(computed_block_ids[self._dsa_main_group_idx]),
                 )
 
-        return delay_free_blocks, dict(
+        transfer_params = dict(
             do_remote_prefill=True,
             do_remote_decode=False,
             remote_block_ids=computed_block_ids,
@@ -2926,6 +2960,12 @@ class MooncakeConnectorScheduler:
             num_prompt_blocks=num_prompt_blocks,
             remote_block_size=self.block_size,
         )
+        if self._dsa_main_group_idx is not None and self._dsa_indexer_group_idx is not None:
+            transfer_params["dsa_block_group_ids"] = {
+                "main": self._dsa_main_group_idx,
+                "indexer": self._dsa_indexer_group_idx,
+            }
+        return delay_free_blocks, transfer_params
 
     def _port_offset_from_handshake_metadata(
         self,
@@ -3431,6 +3471,8 @@ class MooncakeConnectorWorker:
         main_layout = [[] for _ in range(layer_count)]
         indexer_debug_tensors: list[list[torch.Tensor]] = [[] for _ in range(layer_count)]
         main_debug_tensors: list[list[torch.Tensor]] = [[] for _ in range(layer_count)]
+        self._dsa_indexer_cache_keys: dict[int, str] = {}
+        self._dsa_main_cache_keys: dict[int, str] = {}
         host_tensors: list[torch.Tensor] = []
 
         def tensor_entry(
@@ -3463,6 +3505,7 @@ class MooncakeConnectorWorker:
         ]
         for layer_name in indexer_names:
             layer_idx = layer_name_to_idx[layer_name]
+            self._dsa_indexer_cache_keys[layer_idx] = dsa_cache_key(layer_name, self.total_layers)
             cache_tuple = self._as_kv_cache_tuple(kv_caches[layer_name])
             indexer_debug_tensors[layer_idx] = list(cache_tuple)
             for position, tensor in enumerate(cache_tuple):
@@ -3481,6 +3524,7 @@ class MooncakeConnectorWorker:
                 self.decode_manager.offload_layer_names
             ):
                 layer_idx = layer_name_to_idx[layer_name]
+                self._dsa_main_cache_keys[layer_idx] = dsa_cache_key(layer_name, self.total_layers)
                 host_k = pool.k_caches[offload_layer_id]
                 host_v = pool.v_caches[offload_layer_id]
                 main_debug_tensors[layer_idx] = [host_k, host_v]
@@ -3506,6 +3550,8 @@ class MooncakeConnectorWorker:
         """Register the KV Cache data."""
         self.use_mla = self.vllm_config.model_config.is_deepseek_mla
         self.use_sparse = hasattr(self.vllm_config.model_config.hf_text_config, "index_topk")
+        if self._dsa_pd_offload:
+            infer_dsa_block_group_ids([group.layer_names for group in self.kv_cache_config.kv_cache_groups])
         self.enable_sfa_dcp_replicated_indexer = enable_sfa_dcp_replicated_indexer(self.vllm_config)
 
         if self._dsa_pd_offload and self.kv_role == "kv_consumer":
@@ -3553,6 +3599,7 @@ class MooncakeConnectorWorker:
         # Per-layer byte stride between consecutive tensor blocks:
         # [layer_idx][cache_idx] -> stride(0) * element_size.
         self.block_stride_per_addr: list[list[int]] = [[] for _ in range(metadata_layers)]
+        dsa_cache_layout: DsaCacheLayout | None = {} if self._dsa_pd_offload else None
 
         # TODO: For DSV4 use_compress, metadata/transfer can be optimized by
         # aggregating layer views that share the same raw KVCacheTensor.
@@ -3567,6 +3614,15 @@ class MooncakeConnectorWorker:
                 continue
             layer_idx = layer_name_to_idx[layer_name]
             cache_tuple = self._as_kv_cache_tuple(kv_cache_tuple)
+            if dsa_cache_layout is not None:
+                add_dsa_cache_descriptor(
+                    dsa_cache_layout,
+                    layer_name=layer_name,
+                    num_target_layers=self.total_layers,
+                    wire_layer=layer_idx,
+                    first_position=len(self.kv_caches_base_addr[layer_idx]),
+                    tensor_count=len(cache_tuple),
+                )
             # GLM-5.2 shared-indexer layers omit Indexer weights/caches on Prefill
             # (Main K/V only). Decode SFA may still allocate local Indexer slots.
             # Require Main K/V; Indexer(+scale) is optional when present.
@@ -3665,6 +3721,7 @@ class MooncakeConnectorWorker:
             block_strides=self.block_stride_per_addr,
             local_ip=get_ip(),
             handshake_port=self.handshake_port,
+            dsa_cache_layout=dsa_cache_layout,
         )
         self.xfer_handshake_metadata = metadata
 
@@ -3713,6 +3770,8 @@ class MooncakeConnectorWorker:
                 self.kv_recv_thread._dsa_main_owner = (
                     self._pending_runner_host_pool.is_owner
                 )
+                self.kv_recv_thread._dsa_indexer_cache_keys = self._dsa_indexer_cache_keys
+                self.kv_recv_thread._dsa_main_cache_keys = self._dsa_main_cache_keys
             self.kv_recv_thread.start()
         start_wait_time = time.time()
         thread = self.kv_send_thread if self.kv_role == "kv_producer" else self.kv_recv_thread

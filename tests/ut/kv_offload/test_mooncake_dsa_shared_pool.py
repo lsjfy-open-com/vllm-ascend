@@ -22,6 +22,10 @@ def test_blockwise_receive_writes_shared_main_only_on_owner(main_owner):
     thread = object.__new__(KVCacheRecvingThread)
     thread.tp_rank = 0
     thread._dsa_main_owner = main_owner
+    thread.num_layers = 1
+    thread.remote_dsa_cache_layout = {}
+    thread._dsa_indexer_cache_keys = {0: "indexer:0"}
+    thread._dsa_main_cache_keys = {0: "main:0"} if main_owner else {}
     thread._dsa_indexer_local_layout = [[(0, 100, 8, 8, 1)]]
     thread._dsa_main_local_layout = [[(0, 200, 8, 8, 1)]] if main_owner else [[]]
     thread.remote_metadata_lock = MagicMock()
@@ -68,6 +72,7 @@ def test_blockwise_receive_writes_shared_main_only_on_owner(main_owner):
 def test_local_layout_uses_shared_pool_only_on_owner(main_owner):
     worker = object.__new__(MooncakeConnectorWorker)
     worker.num_blocks = 4
+    worker.total_layers = 1
     worker.kv_caches_base_addr = [[], []]
     worker.decode_manager = SimpleNamespace(
         offload_layer_names=["model.layers.0.self_attn.attn"]

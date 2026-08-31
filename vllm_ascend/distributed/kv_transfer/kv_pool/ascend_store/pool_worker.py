@@ -60,6 +60,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
     get_layerwise_config,
+    get_layerwise_physical_layer_index,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_transfer import (
     LayerTransferArrayBuilder,
@@ -671,20 +672,8 @@ class KVPoolWorker:
             return cache.storage().data_ptr()
 
     def _extract_physical_layer_index(self, layer_name: str) -> int:
-        import regex as re
-
-        m = re.search(r"layers\.(\d+)", layer_name)
-        if m:
-            return int(m.group(1))
-        # MTP layers have names like "mtp.0.self_attn.xxx" without "layers."
-        # prefix. Map them after the main model layers.
-        if ".mtp." in f".{layer_name}.":
-            m = re.search(r"mtp\.(\d+)", layer_name)
-            if m:
-                num_hidden_layers = getattr(self.hf_config, "num_hidden_layers", self.num_layers)
-                return num_hidden_layers + int(m.group(1))
-        m = re.search(r"(\d+)", layer_name)
-        return int(m.group(1)) if m else 0
+        num_hidden_layers = getattr(self.hf_config, "num_hidden_layers", self.num_layers)
+        return get_layerwise_physical_layer_index(layer_name, num_hidden_layers)
 
     def _infer_cache_group_metadata(self, group_id: int, layer_names: list[str]):
         group_addrs: list[int] = []
@@ -724,6 +713,24 @@ class KVPoolWorker:
         self.group_block_stride[group_id] = group_block_strides
         self.group_layer_offsets[group_id] = layer_offsets
         self.group_num_layers[group_id] = len(layer_names_by_physical)
+
+    def _refresh_registered_layer_count(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        num_layers = len({self._extract_physical_layer_index(name) for name in kv_caches})
+        if self.num_kv_cache_groups > 1:
+            # Preserve the existing target-layer bound for partial/shared
+            # cache layouts; this migration only adds missing draft layers.
+            num_layers = max(self.num_layers, num_layers)
+        if num_layers == self.num_layers:
+            return
+        logger.info(
+            "KVPoolWorker: updated num_layers %d -> %d (includes physical draft layers).",
+            self.num_layers,
+            num_layers,
+        )
+        self.num_layers = num_layers
+        # No transfer thread has started yet. Rebuild group mappings, task
+        # arrays and the reuse plan against the runner's registered layout.
+        self._init_layerwise_config()
 
     def _align_kv_ptrs(self, registered_regions: dict[int, tuple[int, int]]):
         """
@@ -802,29 +809,17 @@ class KVPoolWorker:
         ptrs = [start for start, _ in registered_regions.values()]
         lengths = [end - start for start, end in registered_regions.values()]
 
+        # Count the union of physical layers before building group metadata:
+        # Main and Indexer groups may both contain the same MTP layer. Using
+        # the target-only count here silently filters that layer out of both
+        # groups; summing group counts would instead count it twice.
+        self._refresh_registered_layer_count(kv_caches)
+
         if self.kv_cache_config is not None and self.use_hybrid:
             for group_id, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
                 self._infer_cache_group_metadata(group_id, group_spec.layer_names)
         else:
             self._infer_cache_group_metadata(0, list(kv_caches.keys()))
-
-        # group_num_layers is computed from the actual kv_caches dict which
-        # includes ALL attention layers (main + MTP). For single-group models,
-        # sum(group_num_layers.values()) equals the physical layer count
-        # (including MTP). For multi-group models, it counts (group, layer)
-        # pairs which is NOT the physical layer count — keep the original
-        # num_layers (physical layers) in that case.
-        original_num_layers = self.num_layers
-        new_num_layers = sum(self.group_num_layers.values())
-        if self.num_kv_cache_groups == 1 and new_num_layers != original_num_layers:
-            self.num_layers = new_num_layers
-            logger.info(
-                "KVPoolWorker: updated num_layers %d -> %d (includes MTP/spec-decode draft layers).",
-                original_num_layers,
-                self.num_layers,
-            )
-            self.layer_load_tasks = [[] for _ in range(self.num_layers)]
-            self.layer_save_tasks = [[] for _ in range(self.num_layers)]
 
         if self.use_gva_layerwise:
             layerwise_config = get_layerwise_config(self.num_layers, self._extra_config)

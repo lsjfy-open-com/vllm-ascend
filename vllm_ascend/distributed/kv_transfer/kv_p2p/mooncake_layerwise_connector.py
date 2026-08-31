@@ -55,6 +55,9 @@ from vllm.v1.worker.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GET_META_MSG
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    get_layerwise_physical_layer_index,
+)
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     RegisterRegions,
@@ -1380,24 +1383,7 @@ class MooncakeLayerwiseConnectorWorker:
         if use_kv_buffer:
             self.create_kv_buffer(kv_buffer)
 
-        model_type = self.vllm_config.model_config.hf_text_config.model_type
-        num_attn_module = 2 if model_type in ("longcat_flash", "longcat_flash_ngram") else 1
-        mtp_layer_name = ""
-        for layer_name in kv_caches:
-            if "mtp" in layer_name:
-                mtp_layer_name = layer_name
-                continue
-            self.index_to_name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
-            names = self.index_to_name[
-                extract_layer_index(layer_name, num_attn_module)
-            ]
-            n_indexer = sum(1 for name in names if "indexer" in name.lower())
-            n_other = len(names) - n_indexer
-            assert n_indexer <= 1 and n_other <= 1, (
-                "Mooncake Layerwise Connector does not support multiple `attn_module` in one layer now."
-            )
-        if mtp_layer_name != "":
-            self.index_to_name[max(self.index_to_name.keys()) + 1].append(mtp_layer_name)
+        self._init_registered_layerwise_layout(kv_caches)
 
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
@@ -1649,6 +1635,42 @@ class MooncakeLayerwiseConnectorWorker:
                     for j in range(self.kernel_block_size_scale[i])
                 ]
         return block_ids
+
+    def _init_registered_layerwise_layout(self, kv_caches: dict[str, Any]) -> None:
+        """Include physical draft layers, bundling their Main/Indexer caches."""
+        config = self.vllm_config.model_config.hf_text_config
+        num_attn_module = 2 if config.model_type in ("longcat_flash", "longcat_flash_ngram") else 1
+        index_to_name: dict[int, list[str]] = defaultdict(list)
+        for layer_name in kv_caches:
+            if "mtp" in layer_name:
+                layer_idx = get_layerwise_physical_layer_index(layer_name, config.num_hidden_layers)
+            else:
+                layer_idx = extract_layer_index(layer_name, num_attn_module)
+            index_to_name[layer_idx].append(layer_name)
+        for names in index_to_name.values():
+            n_indexer = sum("indexer" in name.lower() for name in names)
+            assert n_indexer <= 1 and len(names) - n_indexer <= 1, (
+                "Mooncake Layerwise Connector does not support multiple `attn_module` in one layer now."
+            )
+            names.sort(key=lambda name: "indexer" in name.lower())
+
+        # A speculative step can reuse the same physical MTP layer. Neither
+        # the number of draft tokens nor the number of cache components is
+        # the number of layer transfers required before sending DONE.
+        self.index_to_name = index_to_name
+        # Preserve the runner's target-layer lower bound for layouts which
+        # do not register a separate tensor for every target layer.
+        self.total_layers = max(self.total_layers, len(index_to_name))
+        if self._layer_transfer_finished_events is not None:
+            assert self._layer_transfer_pending_events is not None
+            # Registration precedes the send thread. Keep existing event
+            # objects, and give every extra physical layer its own pair.
+            while len(self._layer_transfer_finished_events) < self.total_layers:
+                done = threading.Event()
+                done.set()
+                self._layer_transfer_finished_events.append(done)
+                self._layer_transfer_pending_events.append(threading.Event())
+        logger.info("Mooncake layerwise registered %d physical layers (including draft KV).", self.total_layers)
 
     def start_load_kv(self, metadata: MooncakeLayerwiseConnectorMetadata):
         """Start loading KV blocks from remote engine."""

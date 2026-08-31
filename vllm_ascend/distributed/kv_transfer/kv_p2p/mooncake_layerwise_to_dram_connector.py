@@ -615,6 +615,45 @@ def ensure_last_layer_done_signals(
     return signaled
 
 
+def transfer_layerwise_d2rh(send_thread, send_task, transfer_one_leg) -> None:
+    """Finish both cache legs before signaling; always release the source."""
+    layer_idx = send_task.layer_idx
+    done_events = send_thread.layer_transfer_finished_events
+    pending_events = send_thread.layer_transfer_pending_events
+    if done_events is not None:
+        done_events[layer_idx].clear()
+    if pending_events is not None and send_task.send_request:
+        pending_events[layer_idx].set()
+    try:
+        if send_task.wait_event is not None:
+            send_task.wait_event.synchronize()
+        # ADXL cannot mix Indexer NPU->NPU and Main NPU->Host in one batch.
+        transfer_one_leg(send_task, skip_indexer=False, skip_main=True)
+        transfer_one_leg(send_task, skip_indexer=True, skip_main=False)
+    except Exception:
+        # Remember failure until the last physical layer, including MTP.
+        # Keeping the worker alive lets subsequent layers drain normally.
+        send_thread.failed_reqs.update(send_task.send_request)
+        logger.exception("MooncakeToDram layer %d transfer failed", layer_idx)
+    finally:
+        try:
+            ensure_last_layer_done_signals(
+                send_request=send_task.send_request,
+                layer_idx=layer_idx,
+                total_layers=send_thread.total_layers,
+                already_signaled=set(),
+                failed_reqs=send_thread.failed_reqs,
+                callback_func=send_thread.callback_func,
+            )
+        finally:
+            # A reshape/transfer/callback exception must not strand the
+            # source-slot waiter. No transfer reads this source after exit.
+            if pending_events is not None:
+                pending_events[layer_idx].clear()
+            if done_events is not None:
+                done_events[layer_idx].set()
+
+
 class MooncakeToDramDecodeScheduler(SFAPDCpuOffloadScheduler):
     """D scheduler: vLLM Main HOST + Indexer HBM ids; advertise for Mooncake Push.
 
@@ -1628,53 +1667,7 @@ class MooncakeToDramProducerWorker(MooncakeLayerwiseConnectorWorker):
                     )
 
         def _transfer_kv_cache_split_types(send_task):
-            # ADXL buffer mode: one TransferSync cannot mix NPU→NPU (Indexer)
-            # with NPU→registered Host pool (Main). Split into two batches.
-            signaled: set[str] = set()
-            orig_cb = send_thread.callback_func
-
-            if send_thread.layer_transfer_finished_events is not None:
-                send_thread.layer_transfer_finished_events[send_task.layer_idx].clear()
-            if (
-                send_thread.layer_transfer_pending_events is not None
-                and send_task.send_request
-            ):
-                send_thread.layer_transfer_pending_events[send_task.layer_idx].set()
-
-            if send_task.wait_event is not None:
-                send_task.wait_event.synchronize()
-
-            # Indexer D2D only (all Prefill ranks → mapped Decode TP HBM).
-            _transfer_one_leg(send_task, skip_indexer=False, skip_main=True)
-            # Main D2RH only (Prefill TP0 → Decode TP0 registered shared Host pool).
-            _transfer_one_leg(send_task, skip_indexer=True, skip_main=False)
-
-            if send_task.layer_idx == (send_thread.total_layers - 1):
-                for req_id, req_meta in send_task.send_request.items():
-                    if not req_meta.chunk_finish:
-                        continue
-                    if req_id in send_thread.failed_reqs:
-                        orig_cb(req_id, req_meta, 0, False)
-                    else:
-                        orig_cb(req_id, req_meta, 0, True)
-                        signaled.add(req_id)
-
-            ensure_last_layer_done_signals(
-                send_request=send_task.send_request,
-                layer_idx=send_task.layer_idx,
-                total_layers=send_thread.total_layers,
-                already_signaled=signaled,
-                failed_reqs=send_thread.failed_reqs,
-                callback_func=orig_cb,
-            )
-
-            if send_thread.layer_transfer_pending_events is not None:
-                send_thread.layer_transfer_pending_events[send_task.layer_idx].clear()
-            if (
-                send_thread.layer_transfer_finished_events is not None
-                and send_task.send_request
-            ):
-                send_thread.layer_transfer_finished_events[send_task.layer_idx].set()
+            transfer_layerwise_d2rh(send_thread, send_task, _transfer_one_leg)
 
         send_thread.get_transfer_meta = get_transfer_meta_asymmetric  # type: ignore[method-assign]
         send_thread._transfer_kv_cache = _transfer_kv_cache_split_types  # type: ignore[method-assign]

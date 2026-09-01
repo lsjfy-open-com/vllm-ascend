@@ -376,3 +376,71 @@ MTP=3 时 `max_num_topk_rows`、selection/membership、current KV descriptor 和
 
 每个提交都保留 guard，直到它对应的 capability 与回归测试同时存在。实验机可在 feature branch 上
 临时解除 guard，但不能把解除 guard 当成功标准。
+
+## 11. 2026-09-01 实验补丁 `54ea583e7` 评审
+
+远端实际状态需要先说清楚：`mte_fuse_0723_mooncake_test_0827_add_block` 仍停在
+`d1bf0bad2`；新补丁 `54ea583e7` 位于 `exp/rebase25-add-block-20260831`。因此实验时必须记录并核对
+commit，不能只写“0827 add block”。该提交的 Main 修复方向是对的：Decode TP0 遍历 Prefill CP
+endpoints，把各 CP-local Main page 按全局 token 起点写入 shared Host view。纯映射函数在 64、128、
+256 token 三组参数下均通过本地 smoke，说明映射公式本身没有把 128 写死。
+
+### 11.1 当前结论：暂不进入正确性实验
+
+这版可以作为代码评审样本，尚不能作为 P8/D1 或 P8/D8 的正确性实验基线。以下问题会继续产生
+“请求完成但 KV 不完整”的假成功：
+
+1. **Indexer 仍然截断。** `_build_dsa_transfer_lists()` 对非 page-packing 路径使用
+   `min(len(source_physical), len(destination_physical))`，P8/D1 的 remote scale=8、local scale=1
+   只复制重叠前缀。它必须按明确的 replicated/partitioned layout 生成完整 destination coverage，无法
+   表达时应 fail closed。
+2. **Main 缺页被静默跳过。** `_build_dsa_unified_main_lists()` 在 `dest_index` 超过 reservation 时
+   `continue`。必须把 expected page/byte range 和实际 unique range 比较；少一页、越界或重叠都返回
+   `TRANSFER_FAILED`，不能只检查 `n_written > 0`。
+3. **多 source 生命周期不完整。** Main gather 读取 P0…P7，但 `_execute_dsa_receive()` 的 `finally`
+   只向最初的 `remote_endpoint` 发送 `DONE_RECVING`。必须在 Indexer 和 Main 均完成并通过 coverage
+   barrier 后，对所有实际使用的 endpoint 逐一 release 并等 ACK；失败/取消也要对已取得 lease 的
+   endpoint 做幂等 abort/release。
+4. **Main remote stride 被丢弃。** 新 builder 直接使用 `remote_base + source_id * remote_len`，却
+   `del remote_strides`。应使用握手提供的 `remote_stride`，或显式验证 `remote_stride == remote_len`；
+   否则带 padding/alignment 的布局会读错地址。
+5. **D=8 读取逻辑尚未实现。** 当前只移除了 connector 和 `sfa_kv_offload` 的启动 guard。
+   fused overlap 仍直接消费原始 `attn_metadata.block_table`，manager 也声明复用原始
+   block table/slot mapping；`cp_local_page_to_unified_index()` 没有接入任何读取或写回路径。因此
+   P8/D8 不能开始数据正确性实验。
+6. **短 prompt 语义不应靠 skip。** 每个 CP rank 的有效页数必须由 token coverage/valid length
+   决定，而不是靠 destination 越界跳过。负向用例必须故意丢一片并确认系统失败。
+
+### 11.2 `128` 的参数契约
+
+`unified_host_slot()` 使用 `p_kernel_tokens` 和 `d_block_tokens` 参数，数值 128 只出现在当前 GLM-5.2
+实验配置、文档示例和 UT fixture 中，并非公式内的常量。`d_block_tokens` 来自
+`_pending_runner_host_pool.layout.block_size`，这部分是运行时值。
+
+但当前实现仍有一项不安全的**隐式推断**：`p_kernel_tokens` 由 remote page bytes、Host block bytes
+和 Host block tokens 的比例推出来。字节比例只能证明容量，不能完整证明 token geometry、dtype、
+layout 或 CP interleave 语义。握手应显式携带并校验：
+
+- `page_tokens`（即 Prefill kernel page token 数）；
+- `host_block_tokens`；
+- dtype、每 token bytes、stride、layout version/fingerprint；
+- `remote_dcp_size`、`remote_pcp_size` 和 CP rank 到 endpoint 的映射。
+
+因此回答是：**公式没有硬编码 128，但协议仍把 128 隐含在当前配置和 byte-ratio 推断里，尚未做到
+真正的配置无关。** UT 至少增加 64/128/256 参数化、stride≠len、reservation 少一页、重复 destination
+和缺 source 的失败用例。
+
+### 11.3 可进入实验的最小补丁范围
+
+先只开放 P8/D1、eager、MTP0，并保留 D>1 guard：
+
+1. 显式 handshake token geometry 与 layout fingerprint；
+2. Main 使用 remote stride，建立 expected/unique/missing/overlap coverage；
+3. 修复 Indexer 完整 planner，删除 `min()` 成功路径；
+4. 为所有 P endpoints 实现 lease、barrier、release/ACK；
+5. 加入缺 shard 必失败的 UT/诊断注入；
+6. 通过 P1/D1 回归后，按 A1→A2 做长 prompt token 级对齐。
+
+P8/D8 需要另一个提交接入 DCP-aware block table、slot mapping、新 token writer contract 和 attention
+组合逻辑，不能通过去 guard 与 P8/D1 同批验证。MTP3 与图模式继续位于 A3/A4，等待 eager MTP0 的
+coverage 和 token 对齐通过后再开。

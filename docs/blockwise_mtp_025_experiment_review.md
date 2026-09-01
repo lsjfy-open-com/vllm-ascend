@@ -7,21 +7,29 @@
 
 ## 当前能下的结论
 
-**最新 MTP 尝试尚未越过 P 的启动门槛，不能据此认定 MTP 缓存映射或图执行失败。**
-实验树也尚未包含本私仓的 blockwise MTP 映射补丁。
+> **2026-09-01 更新：原分支已天然跑通当前目标冒烟。**
+> 最新实验包记录 `d1bf0bad2`、`dirty=false`，没有合入本私仓 MTP 映射补丁；
+> P=`num_speculative_tokens=1`、D=`3`、两侧 draft eager、Decode target
+> `FULL_DECODE_ONLY`、DCP size=1、fused offload、standard blockwise proxy，
+> 在正确清理孤儿进程后 P/D Ready，32-token smoke 返回 `TEST_PD_OK`。
+> 因此本补丁不是这套配置跑通的前置条件，不应为该已通过场景继续改 connector。
+
+**最新 MTP 尝试已在原 `d1bf0bad2` 上越过启动和请求冒烟门槛。**
+实验树不含本私仓的 blockwise MTP 映射补丁，这恰好证明当前 P1/D3 配置不依赖该补丁。
 
 | 证据 | 实际范围 | 能证明什么 / 不能证明什么 |
 | --- | --- | --- |
-| 实验分支 `659291eca` | 父提交为 `d1bf0bad2`，新增 25 个报告文件，生产代码没有变化 | 能确认推送的源码基线；不能证明服务器没有额外 dirty 修改 |
+| 实验分支 `32971d499` | 生产代码父提交为 `d1bf0bad2`；后续提交只新增/更新报告与实验脚本 | 最新三侧 facts 记录 `head=d1bf0bad2`、`dirty=false` |
 | `LATEST.md`、issue 008 | 报告称 `d1bf0bad2`、MTP 关、DCP size=1、Decode `FULL_DECODE_ONLY`；smoke 通过、精度 5/5 | 是实验方的无 MTP 成功记录；本包没有对应晚间三件套或具体精度断言，不能扩写为完整精度保证 |
-| issue 009，20:34 的尝试 1 | P1/D3，draft `enforce_eager=true`；P 的 ZMQ bind 报地址占用 | 最新已记录失败在 connector 启动期；“旧进程未清理”是候选原因，尚无监听者归属证据 |
+| issue 009，20:34 的尝试 1 | P1/D3，draft `enforce_eager=true`；P 的 ZMQ bind 报地址占用 | 历史失败；后续已确认错误停服方式留下孤儿进程 |
+| issue 009，21:24–21:38 的尝试 4 | 同一生产代码 `d1bf0bad2`，正确停服后 P/D Ready；MTP P1/D3 + target FULL 图，32-token `TEST_PD_OK` | 证明当前目标配置可起服、可完成一次生成冒烟；尚不等于 MTP 精度、接受率、并发和长稳验证 |
 | 15:31 三件套 | `baf3cbcf2` dirty、layerwise；D 有 6 类异常摘要 | 历史 planner/引擎退出证据，不是晚间 add_block MTP 失败栈 |
 | 16:13 三件套 | `baf3cbcf2` dirty、layerwise，P/D/proxy 三侧 | 历史 layerwise 事件；异常样本为 0 不代表 blockwise MTP 通过 |
 
 来源：[实验目录](https://gitcode.com/shichangzhang064/vllm-ascend/tree/exp%2Frebase25-add-block-20260831/docs/rebase25-exp)、
 [最新结果](https://gitcode.com/shichangzhang064/vllm-ascend/blob/exp%2Frebase25-add-block-20260831/docs/rebase25-exp/LATEST.md)、
 [MTP 尝试记录](https://gitcode.com/shichangzhang064/vllm-ascend/blob/exp%2Frebase25-add-block-20260831/docs/rebase25-exp/issues/009-add-block-mtp.md)。
-读取时实验分支为 `659291ecafd5626ba8ff93a81babefa4f3d23fac`。
+本次复核读取到实验分支 `32971d499179ae3294e4ce09a842bef2d286e313`。
 另一个 `mte_fuse_0723_mooncake_test_0827_add_block` 链接当时仍是 `d1bf0bad2`，
 其 Git 树里没有 `docs/rebase25-exp`，报告实际新增在 `exp/` 分支。
 
@@ -32,7 +40,7 @@
 - issue 003–006 和 collect 三件套：旧 layerwise/fused planner 排障，树为
   `baf3cbcf2` 且 dirty。其临时 patch、SKIP 开关、shape 修补不能直接照搬到 `d1bf0bad2`。
 - issue 007–009：切到 add_block，先完成无 MTP eager/graph，再尝试 P1/D3。
-  最新公开失败是 P 端口绑定，不是旧 IndexError 或 planner Segfault。
+  最新公开结果已经在正确停服后跑通，不是旧 IndexError 或 planner Segfault。
 
 `issues/ANALYSIS.md` 标题仍称 layerwise 是“当前主线”，已经滞后于 `LATEST.md` / 008 / 009。
 旧的“不要整树切到 add_block”也是当时的历史计划，不是当前行动要求。
@@ -50,14 +58,14 @@ issue 008 同时改变了 offload 配方和共享内存清理，成功只证明�
 后一轮命令还来自脚本 fallback。切换源码/重新编译与安装包元数据不同步可以并存；
 这里不据旧字符串推翻用户确认的当前源码基线。
 
-后续复现只需随新 attempt 记录实际 commit、dirty 状态、源码与构建产物是否匹配，
+最新 21:39 facts 已记录 `d1bf0bad2` 且 dirty=false；后续验证只需随新 attempt 继续记录实际 commit、dirty 状态、源码与构建产物是否匹配，
 用于区分 rc1 上的具体改动。实际路径留在机内，仅返回匹配布尔值与 hash。
-重编译是用户已完成的操作；现有失败栈也没有证据要求再次重编。
+重编译是用户已完成的操作；现有结果没有证据要求再次重编。
 
-本次 ZMQ bind 地址占用与 Mooncake 0.3.13 或 W8A8 没有直接因果证据，
+后续成功重试进一步支持：此前 ZMQ bind 地址占用与 Mooncake 0.3.13、MTP 语义或 W8A8 没有直接因果证据，
 不要为此换 wheel、换量化或回滚 rc1。W8A8 仍不能替代 KV/Indexer dtype 与 scale 的布局信息。
 
-## 3. 端口错误：落点确定，占用原因未定
+## 3. 历史端口错误：已确认是错误停服留下孤儿进程
 
 对照 `d1bf0bad2` 的
 [mooncake_connector.py](../vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py)，
@@ -75,96 +83,62 @@ handshake_port = base + rank_offset
 
 **公式不含 `num_speculative_tokens`，没有“每一个 MTP 步骤新占一个握手端口”的实现。**
 所以 issue 009 的“MTP 多端口更易撞”应撤回；MTP 开启触发了重启，不等于它本身增加端口数。
-如果某种配置导致重复构造/注册 connector，仍可能与 MTP 初始化有间接关系，现有材料无法排除。
+最新 stopfix 结果确认当时 pod 内错误调用宿主机脚本，旧 worker/孤儿进程没有退出；
+在宿主机正确执行停服后，同一 MTP 配置成功。无需再把重复注册或拓扑重叠列为当前首要嫌疑。
 
 另外，`KVCacheSendingThread started listening ...` 日志写在 bind **之前**；
 不能拿这行日志单独证明绑定成功。`ready_event.set()` 在成功进入 socket 上下文之后。
 
-### 需要区分的候选原因
+### 这次的处理边界
 
-| 候选 | 机内需要看到的证据 | 对应处理 |
-| --- | --- | --- |
-| 上一轮 worker/旧实验仍监听 | 新实例启动前端点已被占用，持有者属于旧尝试 | 仅停止已确认归属自己的旧实例；确认退出后重试 |
-| 多服务共享 network namespace 且端口区间重叠 | 各实例计算端口一致，持有者属于另一当前实例 | 协调不重叠的 `kv_port` 区间，并同步 scheduler/worker/远端元数据配置 |
-| DP rank 或 TP/PP/PCP 解析与预期不一致 | 实际 rank/size 组合产生重复端点 | 修启动拓扑/配置，不能靠随机换端口遮住 rank 错误 |
-| 同一 worker 重复注册 | 同一匿名进程在同一尝试中两次进入 `register_kv_caches`，第二次撞自己的监听 | 才进入初始化生命周期修复；需要精简调用栈及注册次数 |
+报告已经给出本次占用者属于 p1/d0/d1 的孤儿 VLLM，并通过正确停服后的同配置成功重试形成闭环。
+仍不能将处理方式泛化成全局清理：只停止确认属于本实验的 worker；不要随机改端口、
+`pkill` 所有服务、删除他人 pod，或把清空 `/dev/shm` 当成释放 TCP socket 的手段。
+以后若相同错误在正常停服后复现，再重新区分端口区间重叠、rank 配置和重复注册。
 
-同一网络命名空间内不同绑定地址（包括通配地址）也可能相互覆盖，端口检查不能只按文本 IP 相等判断。
-源码中注册函数没有针对“再次启动发送线程”的幂等保护，但这只是潜在风险；
-当前 NPUModelRunner 的初始化路径可见一次 connector 注册，包内没有证明它被重复调用。
-不应仅凭错误字符串就加“端口忙时自动跳过注册”或全局随机端口：这可能连接到旧实例、破坏缓存身份。
+## 4. 原分支跑通后，对本私仓补丁的重新定位
 
-也不要 `pkill` 所有 vLLM、删他人 pod、清空全机 `/dev/shm`，或只清主进程不检查子 worker。
-共享内存文件清理本身不能释放另一个活进程仍持有的 TCP 监听 socket。
+最新实验提交 `32971d499` 只增加报告和实验脚本；其生产代码父提交仍是 `d1bf0bad2`。
+21:39 三侧 facts 均记录 Ascend `head=d1bf0bad2`、`dirty=false`；启动脚本明确向 P/D 分别传入
+MTP 1/3 步和 `enforce_eager=true`，D 还传 `FULL_DECODE_ONLY`。重试脚本实际导出
+`ENABLE_MTP=1`，而不是只在文档里声明。D 的三件套记录两次 graph capture complete 和 API Ready。
 
-## 4. 推送的实验分支尚不含我们的 MTP 补丁
+因此应撤回“必须先合入 `ea5db1de7` 才能验证 P1/D3”的方向：
 
-实验分支的生产代码与 `d1bf0bad2` 相同，未包含
-[`ea5db1de7`](https://github.com/lsjfy-open-com/vllm-ascend/commit/ea5db1de718aab49eb32dcc6935b53464d57b97c)。
-那次补丁才增加 `dsa_cache_layout`、`dsa_block_group_ids`、按物理缓存身份匹配及覆盖范围校验。
-本私仓 `codex/blockwise-mtp-025` 已包含这些变化和后续文档答疑。
-这是对推送的 Git 树的判断，不代表已检查容器的额外 cherry-pick 或未提交补丁；
-若容器另有改动，以本次实际 commit/差异为准，不能只凭分支名称判断补丁缺失。
+- 对当前 GLM-5.2、P1/D3、DCP size=1、现有 manager group 布局，原分支已经具备能力；
+- `ea5db1de7` 的物理身份描述符、显式 block 组号和覆盖检查没有参与本次成功；
+- 在没有复现错层、漏传、跨 P/D 组顺序不一致之前，不能把这些防御性变化作为 bug fix 合入；
+- 新协议增加握手字段、校验和兼容面，本身也有回归风险。最稳妥的处理是保留实验分支不动，
+  将 `codex/blockwise-mtp-025` 作为研究分支，先不部署、不宣称必要。
 
-“当前失败”既不能说明该补丁失效，也不能说明旧基线已经支持 P1/D3。
-端口绑定发生在真正处理 PD 请求之前；缓存映射补丁不会替代端口清理或拓扑修正。
+这次 `TEST_PD_OK` 的脚本判据是 HTTP JSON 有非空生成内容，并非只检查 200；
+但脚本会把输出内容写入实验机原始日志，不能外传。当前材料没有 MTP 候选/接受/拒绝统计，
+所以“配置已打开并完成端到端冒烟”成立，“MTP 一定贡献了 token/加速”尚未由统计证明。
+同样，MTP 关的精度 5/5 与 eager 压测 12/12 不能转写成 MTP 开的精度/压测结果。
 
-建议分两步，不混变量：先在当前失败提交上确定并解决端口问题，记录 P Ready 即止；
-然后 P/D 同时切到包含 `ea5db1de7` 的同一受控提交，核对加载来源，再执行最小 MTP 验收。
-无需为了端口问题重跑旧的 DCP8、layerwise 或完整精度矩阵。
+下一步无需先改 connector。若目标只是确认功能，再在原 `d1bf0bad2` 上补一次 MTP 开的
+固定精度小集及 speculative 汇总统计；只有出现确定的错层/缺组件/容量截断，再用具体失败输入
+评估 `ea5db1de7` 中哪一部分值得最小化迁移。DCP>1、额外 manager group、不同模型布局
+仍未由这次冒烟覆盖，不能将“天然跑通”外推到这些拓扑。
 
-交付场景既然是 P1/D3，后续沿用该组合：先两侧全局 eager，再恢复实际 target 图配置。
-GLM 在该分支的 proposer 命中 `model_type` 的 `glm` 判断时强制 draft eager；
-`speculative.enforce_eager=true` 也明确要求 draft eager。
-因此 `FULL_DECODE_ONLY + MTP` 仍表示 target graph + draft eager，不是 draft graph 能力验收。
-继续保持 `multistream_overlap_shared_expert=false`，不要关闭 D 侧必要的 offload `use_fused_overlap=true`。
-详细通过标准沿用 [迁移文档](blockwise_mtp_025_migration.md)，不新增全排列实验。
+## 5. 仍需补的证据很小
 
-## 5. collect 结果的缺口与最小补采任务
+21:39 的 collect 包已经对应成功重试：P、D 和 proxy 均记录 `d1bf0bad2`、dirty=false 和 API Ready；
+D 还记录两次 graph capture complete。它足以辅助确认服务启动与图捕获，原始输出无需外传。
+但采集器没有记录 blockwise MTP 候选/接受/拒绝统计，也没有证明候选实际贡献了生成 token。
 
-已有 collect 包做到了限制原始内容外传，但不是晚间 MTP 失败的对应包。
-`analysis.md` 主要是自动模板，列出“待验证”，尚未完成引用事件编号的人工归因。
-不能把“唯一异常样本 0”或 `matches_reviewed_experiment=true` 当成当前实验通过：
-后者匹配的是旧采集器审阅的 `baf3cbcf2`。
+下一轮无需再采端口排障包，也无需先部署本私仓补丁。仅在原分支 MTP 开的精度小测中增加白名单汇总：
 
-15:31 的 E002 能看到 TP0 的 manager 异常链，随后有 EngineDead 类异常；
-错误类型/原因被折叠成 `other_exception` / `message_withheld`。
-issue 005 称当时是移植漏定义 `external_plan_debug` 的 NameError；这是报告的解释，
-三件套本身不足以独立确认具体未定义变量。无需为了当前端口问题重做这轮历史排障。
+- 实际 connector、P/D speculative 步数、target graph mode 及 draft eager；
+- speculative 候选、接受、拒绝和回退的汇总计数；
+- 固定精度断言的通过/失败数和首次分歧位置，不含 prompt、输出文本或 token IDs；
+- PD 命中、Main/Indexer 传输阶段和各 TP result kind 的计数，不含 block IDs、地址和请求标识。
 
-旧采集器的白名单没有 `NameError`、`ZMQError` 和 `Address already in use` 原因码，
-事件也以 layerwise 为主。继续使用原版本可能将本轮关键原因隐藏；
-**不能因此放开输出任意异常原文或完整配置**。后续采集应增加固定错误类型/原因码、
-blockwise 阶段和受限配置字段，并用含凭据、地址、prompt 的合成输入确认不会泄漏。
-本次没有修改采集器，也不把下面字段描述为现有脚本已支持的选项。
-
-### 给实验机执行者：先补一次启动包，暂不压测
-
-1. 为这次重试建立新的匿名 attempt，所有 P/D/proxy 使用同一个关联范围。
-   只选本次进程启动到 Ready 或首次退出的日志范围，禁止拼入 15:31/16:13 的旧日志。
-2. 在停服或改配置前，机内确认报错端点的监听者；原始 `ss/lsof`、进程 argv、容器详情只交给
-   本地确定性过滤程序，不输出到外部 agent 上下文。未知所有者就标记 unknown，不自动终止。
-3. 输出下面白名单表。数值端口、PID、网络地址、完整路径和请求内容不需要外传；
-   使用本次尝试内一致的主机/实例/进程匿名别名，仅保留关系、计数和 rank。
-4. 区分清理前和清理后；只处理确认属于本实验的实例。先确认 P 能 Ready；失败时停止堆叠开关。
-5. 拿到 Ready 后再执行上一节的补丁部署和小请求集。额外 group 等显式不支持布局出现时停止，
-   回传布局计数，不靠删校验继续跑。
-
-| 输出组 | 仅需返回的字段 |
-| --- | --- |
-| 运行身份 | 角色、匿名实例、attempt；Ascend/vLLM commit、dirty 布尔、包版本；worker 导入与目标 checkout 匹配布尔；未观测项为 null |
-| 有效配置 | 实际 connector 类、`dsa_pd_offload`、Main/Indexer group 数；DP/TP/PP/PCP/DCP size 和 rank；P/D speculative 步数、全局/局部 eager、实际 graph mode |
-| 绑定复核 | 匿名 namespace/端点别名；期望端点总数、唯一数、重复数；启动前已有监听数量；所有者为本次/旧尝试/其他/未知；同一匿名进程注册次数（可观测才填） |
-| 首个失败 | 固定异常类型 `ZMQError`；固定原因 `address_in_use`（实际命中才填）；仓库相对文件/已审核函数名；角色/rank；匿名端点；不要异常原文 |
-| 生命周期 | bind 成功数、worker Ready 数、API Ready 布尔；前后窗口顺序；缺失/截断计数；只看到 bind 前的 started-listening 日志不能记 bind 成功 |
-| 后续功能小测 | P/D 同提交匹配；真实 PD 命中数、必要 MTP Main/Indexer 组件计数；各 rank 结果种类计数；生成/接受/拒绝候选计数；准确性检查的断言类型与通过数，不含输出文本/token IDs |
-
-绑定失败的当前阻塞无需 checkpoint 内容、请求全文、完整日志或更多性能数据。
-诊断未知值保持 null；数据不支持的“残留进程已坐实”“MTP 功能错误”“rc1 上 MTP 功能已通过”都不要写。
-“运行版本是 rc1”已经由用户确认，与“MTP 功能验收通过”是不同结论。
+这些结果能区分“配置并成功生成”与“MTP 真正参与且结果正确”。只有出现具体的缓存错层或漏传，
+再提取布局的层数、group 数、dtype/shape 和固定错误码，评估是否需要最小 connector 修复。
 
 ## 本次复核交付范围
 
-只新增此分析文档，没有修改实验分支、运行代码、端口分配、采集器或启动脚本。
-已核对 Git 树差异、当前 connector/proposer 源码与四套 facts 的证据边界。
-未在 NPU 上复现或修复；没有新增实机测试结论。
+本次根据最新实验包更新此分析文档，没有修改实验分支、运行代码、端口分配、采集器或启动脚本。
+已核对 Git 树差异、实际归档脚本、最新三侧 facts 和 `TEST_PD_OK` 判据。
+实机成功是实验方提供的结果；本地没有 NPU，未独立复现。

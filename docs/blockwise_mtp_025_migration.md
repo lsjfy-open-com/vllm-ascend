@@ -1,5 +1,13 @@
 # 0.25rc1 blockwise MTP 迁移
 
+> **2026-09-01 实验状态更新：当前目标配置无需本补丁即可跑通。**
+> 原 `d1bf0bad2` 在没有合入 `ea5db1de7` 的情况下，已完成 GLM-5.2、
+> P1/D3、DCP size=1、Decode target `FULL_DECODE_ONLY`、draft eager 的 32-token
+> PD 冒烟。此前启动失败由错误停服留下孤儿进程导致。本文后续设计是针对潜在错层、
+> 跨端 group 顺序和漏传的研究性增强，不是当前配置的必需修复。没有出现具体布局错误前，
+> 保留原分支，不部署本补丁；先补 MTP 开启后的精度和 speculative 汇总统计。
+> 证据复核见 [实验包复核](blockwise_mtp_025_experiment_review.md)。
+
 ## 与 layerwise 的关系
 
 本分支直接基于 GitCode `mte_fuse_0723_mooncake_test_0827_add_block` 的

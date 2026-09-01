@@ -7,24 +7,26 @@
 基线：vLLM Ascend 0.25rc1、GLM-5.2 W8A8、Mooncake 0.3.13、
 `MooncakeConnector + dsa_pd_offload`、Decode fused offload。
 
-## 1. 最新日志能证明什么
+## 1. 日志证据必须按代码路径分开
 
-0831 实验分支最新 tip 为 `bab99d9c5`，生产代码基线仍为 `d1bf0bad2`，
-现场打了 `ALLOW_DCP8_OFFLOAD`，所以 collect 记录 `dirty=true`。
+用户确认测试机已经解除两个 guard，但该现场改动没有上传。因此 guard 只能说明仓库默认代码的
+能力边界，**不能作为用户所述最新运行的根因**。
 
-| 项目 | 事实 | 边界 |
+当前归档中有两条一手错误链：
+
+| 路径 | 一手错误 | 能证明的范围 |
 | --- | --- | --- |
-| P | DCP=8，Ready | P 侧启动完成 |
-| D | DCP=8，模型权重和内存 profile 完成后失败 | 还未进入图捕获和请求传输 |
-| 第一层限制 | `sfa_kv_offload.py` 的 `enable_cp()` 拒绝已被现场移除 | 只说明越过第一道 guard |
-| 第二层限制 | `MooncakeConnector.__init__` 拒绝 `DCP * PCP != 1` | 当前直接根因 |
-| MTP | 实验 facts 明确是 `MTP=0` | 尚未验证 MTP=3 |
-| 图模式 | 配方声明图开，但 D 在 connector 初始化失败 | 没有发生 graph capture |
+| 旧 layerwise / ConnectorV1 | `_get_kv_split_metadata` 访问 `remote_block_ids[group_idx]` 发生 `IndexError` | MTP 开关均复现，DCP 关后消失；说明旧路径的 DCP group 元数据不对齐 |
+| add_block P8/D1 | `remote_scale=8`、`local_scale=1`，source/destination 物理覆盖不相等 | 非对称物理页映射没有实现；临时 `min(...)` 只保留一个物理页 |
 
-因此这次失败不是 Mooncake 传输错误，也不是 MTP 或图模式错误。它发生在 Decode
-connector 初始化，服务尚未创建可执行请求的数据面。
+旧 `IndexError` 不能直接套到 add_block；实验 issue 010 也明确记录 add_block 当时尚未进入请求 KV
+路径。对于用户所述“两个 guard 已解除、P Ready、D 失败”的最新 add_block 运行，仓库里还缺少
+解除 guard 后的首个 traceback 和 phase 计数，因此具体爆点保持未知。
 
-## 2. 为什么不能继续只删第二个校验
+本文后续只依据可由代码静态确认的结构性缺口设计方案：单 endpoint 派发、Decode TP0 Main owner、
+P8/D1 截断传输以及 offload 与 DCP attention metadata 未组合。
+
+## 2. 为什么不能只删除两个 guard
 
 当前有三道能力门槛：
 
@@ -66,6 +68,10 @@ Decode Host pool 是所有 TP rank 映射的一段 Mooncake shared segment，但
 这在 DCP=1 时避免 Main 重复传输；在真 DCP=8 下，八个 P rank 持有不同 Main 序列分片，
 TP0 无法靠当前单 endpoint 命令收齐全部分片。
 
+首期正确性方案应保留这个所有权模型：**仍由 Decode TP0 单独建立 Main layout 和写 shared
+Host pool，但 TP0 必须从 P0…P7 八个 CP source 聚合全部 Main shards。**“各 D rank 并行写
+Host”是后续利用 MemFabric 多 TP 互传的优化方向，不是当前实现，也不是首期最小改法。
+
 ### 3.3 Indexer 和 Main 的 CP 语义不同
 
 SFA DCP 的 Indexer 在每个 DCP rank 上是完整 replicated view；Main KV 是 DCP-local shard。
@@ -80,6 +86,18 @@ SFA DCP 的 Indexer 在每个 DCP rank 上是完整 replicated view；Main KV �
 合并后才是全局结果。当前 `npu_fused_sparse_attention_overlap` 调用只返回 attention output，
 offload 实现没有 DCP LSE merge。若算子接口不能返回 partial output + LSE，就不能直接实现
 “每 rank 只读本地 Host shard”的真 DCP fused 路径。
+
+### 3.5 P8/D1 + MTP 的“通过”不能证明数据正确
+
+P8/D1 首次进入 add_block receive 时，报错位置在第一个 `INDEXER_D2D` 规划：一个逻辑 source
+block 按 `remote_scale=8` 展开为八个物理页，一个 Decode destination 按 `local_scale=1` 只有一个
+物理页。现场补丁使用 `min(...)` 后只复制第一对物理页。
+
+Main 又是独立问题：当前 D TP0 只选择一个 P leader endpoint，所以最多拉到该 endpoint 持有的
+Main shard。MTP 只在这份不完整 target KV 上继续 draft/verify，不会自动补齐丢失的 CP shards。
+
+当前“精度 5/5”只是返回文本的期望子串检查，压测只检查 HTTP 成功和时延。模型在缓存缺失、
+未初始化或错误映射时仍可能产生文本，所以这些结果只能称为链路冒烟，不能称为非对称 DCP 正确。
 
 ## 4. 目标逻辑视图
 
@@ -123,17 +141,19 @@ P7 Indexer(full) ──> D7 Indexer(full)
 
 传输规划按 global token interval 生成，不再按两个列表的最小长度静默截断。
 
-### 5.2 Main：每个 D rank 拉对应 P shard
+### 5.2 Main 首期：TP0 聚合所有 P shards
 
 ```text
-P0 Main(shard0) ──> D0 Host shard0
-P1 Main(shard1) ──> D1 Host shard1
-...
-P7 Main(shard7) ──> D7 Host shard7
+P0 Main(shard0) ─┐
+P1 Main(shard1) ─┤
+...              ├──> D TP0 owner ──> Shared Host Main(full)
+P7 Main(shard7) ─┘                         │
+                                          └──> D0...D7 只读
 ```
 
-八个 D rank 并行写 shared segment 中互不重叠的物理区域。这样可以使用 MemFabric/Mooncake
-多 TP 互传，并消除 TP0 的单点传输压力。
+这与当前 Host pool 所有权一致：只有 Decode TP0 建立 Main layout 并写 shared segment。需要修改
+的是 TP0 的 source 选择，从单个 `leader_rank` endpoint 改成按 CP shard 遍历 P0…P7，并把八份
+Main shard 写到全局 Host view 的对应位置。
 
 shared Host pool 推荐使用全局交错物理编号：
 
@@ -141,30 +161,31 @@ shared Host pool 推荐使用全局交错物理编号：
 host_physical_block = local_block * C + owner
 ```
 
-同一个 scheduler virtual block 对应八个 Host physical blocks；每个 D rank 只写自己的
-`owner` 槽位。布局必须把 `C`、`I`、block size、num blocks 和 layout epoch 放进 fingerprint。
+同一个 scheduler virtual block 对应八个 Host physical blocks；首期全部由 TP0 写入，其他 D ranks
+映射后只读。布局必须把 `C`、`I`、block size、num blocks 和 layout epoch 放进 fingerprint。
 
 ### 5.3 完成条件
 
 一个请求只有同时满足以下条件才能从 `WAITING_FOR_REMOTE_KVS` 进入 Decode：
 
 ```text
-8 × INDEXER_D2D complete
+8 × INDEXER_D2D complete（每个 D rank 一项）
 AND
-8 × MAIN_D2RH complete
+8 × MAIN source-shard complete（全部由 D TP0 汇报）
 AND
 all layout/coverage checks pass
 ```
 
 每个 D rank 只向自己实际读取的 P endpoint 发送 done/release。Scheduler 聚合结果时使用
-`(request_id, tp_rank, dcp_rank, phase)`，不能只按 TP rank 或 TP0 完成判断。
+`(request_id, component, source_dcp_rank, destination_tp_rank)`。Main 虽只有 TP0 writer，也不能把
+“TP0 一次 command 完成”误当作八个 source shards 全部完成。
 
-## 6. attention/offload 有两个实现选择
+## 6. attention/offload 的实现选择
 
-### 方案 A：完整 Host view，功能优先
+### 方案 A：TP0 多 source 的完整 Host view，首期正确性
 
-八个 D rank 共同把完整 Main KV 写入 shared Host pool；每个 rank 的 fused kernel 都能看到完整
-Host KV，使用全局 top-k 计算自己的 TP heads。
+Decode TP0 从八个 P CP sources 聚合完整 Main KV，写入 shared Host pool；每个 D rank 的 fused
+kernel 都能看到完整 Host KV，使用全局 top-k 计算自己的 TP heads。
 
 优点：不需要 partial output/LSE merge，比较接近当前 fused operator 合同。
 
@@ -183,8 +204,14 @@ Host KV，使用全局 top-k 计算自己的 TP heads。
 1. fused operator 返回 partial output 与 LSE；或
 2. 先把各 rank 命中的 selected KV all-gather 成完整小集合，再执行一次完整 SFA。
 
-推荐把方案 B 作为正式目标。若短期必须先看 P8/D8+MTP+图能否走通，可以实现方案 A，
-但必须用显式 capability 名称和日志标注 `full_host_fallback`，避免误判性能。
+### 方案 C：多 D rank 并行写 shared Host，后续传输优化
+
+让 `D_i <- P_i` 并行搬运 Main shard，可利用 MemFabric 多 TP 互传并减轻 TP0 压力。但这要求
+shared segment 的跨 rank 注册、无重叠物理区间、八 writer barrier、失败回滚和 release 语义均已
+定义。它改变当前 TP0 owner 合同，不适合作为首期正确性补丁。
+
+推荐先实现方案 A，建立可验证的完整 KV 基线；正式扩展目标再选择 B。方案 C 只改变传输并行度，
+不能替代 B 所需的 DCP attention 语义。
 
 ## 7. 控制面修改范围
 
@@ -198,16 +225,16 @@ Host KV，使用全局 top-k 计算自己的 TP heads。
 ### 7.2 `mooncake_connector.py`
 
 - `_DsaParallelTopology` 增加 DCP/PCP，并首先限制 `PCP=1`、`DCP==TP`。
-- 用显式 `(tp_rank, dcp_rank)` 选 endpoint。
+- Indexer 用显式 `(tp_rank, dcp_rank)` 选一个等价 replica；Main owner TP0 获取全部 P CP endpoints。
 - Indexer/Main 分别调用 component-specific planner。
-- 非 owner rank 建立自己的 Main shard layout，允许多 rank 写 shared segment 的不重叠区域。
-- 完成聚合等待所有 DCP ranks 和两个 phases。
+- 首期保持非 owner rank 的 Main transfer 为空，由 TP0 逐 source shard 写完整 shared Host view。
+- 完成聚合分别等待八个 Indexer rank 和 TP0 的八个 Main source-shard results。
 - 删除 hard guard 只能放在上述能力检查完成之后。
 
 ### 7.3 `host_pool.py`、`model_runner_v1.py`
 
 - Host layout 增加 DCP interleave 描述和全局物理块容量。
-- 每个 rank 暴露自己的 shard view；owner 仍只负责创建 shared segment，不再垄断写入。
+- 首期保持 TP0 创建并写 shared segment，所有 D ranks 映射完整只读 view。
 - 内存规划按“完整序列一份”计费，不能每个 rank 重复申请完整 DRAM。
 
 ### 7.4 `sfa_v1.py`、`sfa_kv_offload.py`
@@ -238,14 +265,15 @@ sequenceDiagram
     PS-->>DS: remote source metadata
     DS->>DS: 分配 Indexer HBM + Main logical blocks
     par 每个 DCP rank
-        D->>P: GET_META(layout epoch)
-        D->>P: INDEXER_D2D
-        D->>H: MAIN_D2RH 写本 rank shard
+        D->>P: INDEXER_D2D，从等价 replica 拉完整 Indexer
+    and Decode TP0 Main owner
+        D->>P: 逐 P0..P7 拉 Main shard
+        D->>H: 按全局 owner 位置组装完整 Main
     end
-    D-->>DS: 每 rank、每 phase result
-    DS->>DS: 16 项全部成功后解除 KV wait
+    D-->>DS: 8 个 Indexer + 8 个 Main source-shard result
+    DS->>DS: coverage 无缺口/重叠后解除 KV wait
     DS->>D: MTP target/draft Decode
-    D->>H: 新 token 按 owner 写 Main
+    D->>H: 读取完整 shared Main view
     D->>D: replicated Indexer 更新
     D-->>PS: 各 source done/release
 ```
@@ -258,9 +286,10 @@ sequenceDiagram
 不要一次叠加 DCP、MTP、图模式和性能压测。建议按以下门槛推进：
 
 1. **纯 CPU UT**：C=2/8 的 token interval、global/local block 映射、无缺口/无重叠。
-2. **connector UT**：replicated Indexer 只生成完整覆盖，sharded Main 汇总覆盖等于全局范围。
-3. **DCP=2 eager、MTP关**：P/D Ready；1、2、3、8 个 interleave 边界的精确 token 对齐。
-4. **DCP=8 eager、MTP关**：同样的覆盖与精度检查。
+2. **connector UT**：Indexer component-specific packing 不截断；TP0 从 C 个 Main sources 生成
+   无缺口、无重叠的完整 Host coverage。
+3. **P DCP=2 / D DCP=1 eager、MTP关**：先证明 TP0 多 source 重组，逐 token 对齐 DCP=1 基线。
+4. **P/D DCP=2，再到 8，eager、MTP关**：加入 CP-aware offload metadata 后做相同检查。
 5. **DCP=8、MTP P1/D3、draft eager**：候选/接受/拒绝、target/draft cache identity。
 6. **FULL_DECODE_ONLY**：先 capture，再同样的精度集；确认 runtime 无重新分配。
 7. **并发/长序列**：最后测 TTFT/TPOT，且同时上报每个 P/D rank 的 transfer bytes。
@@ -270,10 +299,10 @@ byte 数、coverage 缺口/重叠、首次 token 分歧、MTP 汇总和性能分
 
 ## 10. 当前决策建议
 
-1. 不把 issue 013 当作 connector bug；它只是 guard 正常阻止了未实现组合。
-2. 不继续用“删除 `DCP * PCP == 1`”作为下一轮实机补丁。
-3. 先选择方案 A 或 B。若目标是验证部署组合，A 可作为明确标注的 fallback；若目标是获得
-   DCP8 的真实扩展能力，应直接做 B。
+1. 不把未上传的 guard 改动或旧 layerwise `IndexError` 当作最新 add_block 失败根因。
+2. 不继续用删除 guard 或 `min(source, destination)` 作为下一轮实机补丁。
+3. 先做方案 A：TP0 多 source 聚合、组件独立规划、逐 source coverage barrier；用 token 级基线
+   证明数据完整后，再进入对称 DCP attention。
 4. 首期只支持 `PCP=1`、P/D `DCP==TP`、P_DCP==D_DCP、block size 等于 CP interleave，
    避免同时引入 PCP 和非对称映射。
 5. MTP 和图模式在 DCP 基础数据面通过后再打开。最新日志尚未覆盖它们。

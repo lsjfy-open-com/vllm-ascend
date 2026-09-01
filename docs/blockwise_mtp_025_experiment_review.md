@@ -207,7 +207,7 @@ if dcp_size * pcp_size != 1:
 
 ## 7. 2026-09-01 0831 实验仓最新同步
 
-实验分支已从 `a104e91a0` 更新到 `a399aa36a`。新增结果覆盖 P DCP=8 / D DCP=1，
+实验分支已更新到 `bab99d9c5`。新增结果覆盖 P DCP=8 / D DCP=1，
 以及在该配置上叠加 MTP。生产代码名义基线仍是 `d1bf0bad2`，但本轮 collect facts 明确记录
 `dirty=true`、`matches_reviewed_experiment=false`；因此它不是原提交天然具备的非对称 DCP 能力。
 
@@ -223,6 +223,9 @@ if dcp_size * pcp_size != 1:
 对称 8/8 与非对称 8/1 暴露的是两个独立门槛：前者先被 Decode offload 的 CP 硬拒绝挡住，
 后者越过起服后在 blockwise DSA 物理页覆盖检查失败。不能用 P8/D1 的通过替代 D8 offload 验证。
 
+用户确认测试机随后已解除 guard，但改动没有随归档上传。因此该现场后续失败的具体根因必须以
+解除 guard 后的首个 traceback 为准；现有旧 layerwise `IndexError` 不能直接套用到 add_block。
+
 ### 7.2 非对称临时补丁存在数据完整性风险
 
 实验脚本 `_tmp_patch_dsa_asymmetric_dcp.py` 把原来的“source/destination 物理覆盖必须相等”改为：
@@ -233,19 +236,23 @@ for source_id, destination_id in zip(source_physical[:n], destination_physical[:
     # transfer one overlapping page
 ```
 
-已记录的失败现场是 `remote_scale=8`、`local_scale=1`，两侧都只有一个逻辑 block ID。
-这意味着补丁只安排一个物理页传输，其余七个 source physical pages 没有 destination，也没有被传输。
-如果 P 的八个物理页代表 DCP 拆分后的不同序列内容，D DCP=1 必须重组全部分片；静默取交集会把
+已记录的失败现场出现在第一个 `INDEXER_D2D` 规划：`remote_scale=8`、`local_scale=1`，两侧
+都只有一个逻辑 block ID。补丁只安排一个物理页传输，其余七个 source physical pages 没有
+destination，也没有被传输。D DCP=1 必须得到完整 Indexer view；静默取交集会把
 “metadata 不兼容”变成“请求可返回但缓存可能不完整”。当前结果没有提供八个 source shards 的
 逐分片覆盖计数或 Main/Indexer 校验和，不能排除 Decode 使用部分 KV、回退计算或测试未触及缺页。
+
+Main 不经过这一次 Indexer 报错就能证明正确。当前只有 Decode TP0 是 Main owner，而且 TP0 command
+只选择一个 P leader endpoint；在 P DCP=8 时，它最多取得该 endpoint 的 Main shard。也就是说，
+Indexer 被截断和 Main 单 source 是两个独立的数据完整性问题。
 
 因此当前结论应写成：**P8/D1 在临时截断补丁上完成了功能与负载冒烟**，不能写成
 “`d1bf0bad2` 已支持非对称 DCP”，也不能把该补丁直接迁入正式分支。
 
 正式实现应按组件区分语义：
 
-- replicated Indexer 可从一个明确的 P CP source 拉一份，但必须验证它在各 CP rank 等价；
-- sharded Main KV 必须从全部 P CP sources 收齐并写入 D 的完整 Host 视图；
+- replicated Indexer 必须按组件语义构造完整 view，不能复用 Main 的 `min(...)` 物理页规则；
+- sharded Main KV 首期由 Decode TP0 从全部 P CP sources 收齐并写入完整 Host 视图；
 - 每个 source endpoint 都要有独立完成和释放语义；
 - 若一张 D 物理页无法容纳八张 P 物理页，应先修正逻辑 block、页长和 destination allocation，
   而不是截断列表。

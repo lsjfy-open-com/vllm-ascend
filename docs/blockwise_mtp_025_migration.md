@@ -157,6 +157,14 @@ scheduler 的 `build_connector_meta` / `update_connector_output`。
 
 ## 兼容性与未覆盖范围
 
+### PCP / DCP 当前不支持开启
+
+P 侧 PCP、D 侧 DCP 的职责划分是对的，但当前 `d1bf0bad2` blockwise DSA 只支持两者 size=1。
+实验脚本的“对称 DCP=1”表示没有并行，P 侧也固定 PCP=1。Decode connector 有
+`DCP * PCP == 1` 的硬校验；DSA endpoint 和命令协议也没有 PCP rank 维度。普通 Mooncake
+路径里的 CP split 代码不会被 `DsaConnectorMetadata` 路径复用。不能只删校验；完整设计和
+最新压测数据见 [实验包复核](blockwise_mtp_025_experiment_review.md)。
+
 - 新字段是可选握手扩展，原地址数组保持不变。真实 msgspec 测试覆盖新读旧、旧读新编解码。
   无 MTP 旧对端保留原 positional 解析入口；这不等于所有跨版本拓扑已经实测。
 - **MTP 请 P、D 同时升级到本分支。** 旧 P 没有描述符时，新 D 的 MTP 接收会明确拒绝。

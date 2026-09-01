@@ -137,6 +137,68 @@ D 还记录两次 graph capture complete。它足以辅助确认服务启动与�
 这些结果能区分“配置并成功生成”与“MTP 真正参与且结果正确”。只有出现具体的缓存错层或漏传，
 再提取布局的层数、group 数、dtype/shape 和固定错误码，评估是否需要最小 connector 修复。
 
+## 6. 最新精度/简单压测与 PCP/DCP 支持判断
+
+2026-09-01 的实验分支更新到 `a104e91a0`；生产代码仍是 `d1bf0bad2`，新增的是结果、
+性能基线和复现实验脚本。MTP+图配置新增两项正向结果：
+
+| 项目 | 结果 | 结论边界 |
+| --- | --- | --- |
+| 精度小集 | `MAX_TOKENS=256`，5/5 `ACCURACY_PD_OK` | 当前固定小集通过，不代表完整模型评测 |
+| 简单压测 | concurrency=4，N=16，input≈512，max_tokens=32；16/16 成功 | 证明短负载并发可用，不是长稳或容量结论 |
+| TTFT | p50 1.201s，mean 1.160s | 客户端首 token，包含 P、KV 传输和 D |
+| E2E | p50 2.444s，mean 2.342s | 当前短输出工作负载的端到端时间 |
+
+报告同时列出 eager/无 MTP 的 12 请求基线：TTFT p50 1.710s、E2E p50 11.561s。
+两轮样本数不同，而且同时改变 graph 与 MTP，不能把差值单独归因给 MTP 或 graph；
+可以将 MTP+FULL 图的数值作为当前整体配方基线。仍缺 speculative 接受/拒绝计数和更长负载。
+
+### PCP 和 DCP 的角色
+
+概念上，PCP 用于 P 的长 prompt 计算分片，DCP 用于 D 的 KV 序列分片；实际拆分配置通常是：
+
+```text
+P 服务：prefill_context_parallel_size = P_PCP (>1 才算开启)
+        decode_context_parallel_size = 1
+D 服务：prefill_context_parallel_size = 1
+        decode_context_parallel_size = D_DCP (>1 才算开启)
+```
+
+PCP 会增加 Prefill 的执行 ranks；DCP 复用 TP ranks。`additional_config.enable_dsa_cp` 是另一条
+DSA-CP 机制，不能与 PCP 或 blockwise PD connector 的 DSA 名称混为一谈。
+
+shichang 当前实验脚本并没有打开 CP：P/D 都传 `--prefill-context-parallel-size 1`，
+并把名为 `PREFILL_DCP_SIZE` / `DECODE_DCP_SIZE` 的变量作为
+`--decode-context-parallel-size 1` 传入。**size=1 是单 rank，即关闭；“对称 DCP=1”不是开了 DCP。**
+P 脚本中的 `PREFILL_DCP_SIZE` 只是变量名，不是 PCP。D 脚本还设置 `enable_dsa_cp=false`。
+
+### 当前 blockwise DSA 代码为何不支持 CP>1
+
+`MooncakeConnector` 在 `dsa_pd_offload=true` 且角色为 Decode consumer 时明确校验：
+
+```python
+if dcp_size * pcp_size != 1:
+    raise ValueError("Blockwise DSA Decode requires DCP * PCP == 1 ...")
+```
+
+因此 D 服务把 DCP 或 PCP 设为大于 1 会在 connector 初始化时直接失败。P 侧没有这条同位置断言，
+但也不能据此声明 PCP 可用：
+
+- `_DsaParallelTopology` 只描述 TP/DP/PP，没有 PCP/DCP；
+- DSA 的 `RemoteSource.endpoints_by_prefill_rank` 只按 Prefill TP size 构造；
+- `_dispatch_dsa_commands` 用 Decode TP rank 映射一个 Prefill TP leader，未包含 PCP rank；
+- DSA receiver 从 `DsaConnectorMetadata` 提前进入 `_start_dsa_commands`，不会走普通
+  `MooncakeConnectorMetadata` 的 `_get_kv_split_metadata` CP 分片逻辑。
+
+文件里 `remote_pcp_size` / `remote_dcp_size`、`_get_kv_split_metadata` 和 CP group-pull 代码
+属于普通 Mooncake Pull 路径。它们存在不代表 blockwise DSA 的 Indexer D2D + Main D2RH 已支持 CP。
+
+**当前支持声明应保持为 P_PCP=1、D_DCP=1。** 若要支持“P 开 PCP、D 开 DCP”，
+需要先扩 DSA 协议和拓扑：携带 P/D CP size/rank，按 TP×PCP 发布全部 P endpoint，
+明确 virtual block 到各 CP shard 的 Main/Indexer block 路由，D 各 rank 聚合完成结果，
+并重新验证共享 Main owner、Indexer replicated/sharded 语义、MTP、prefix cache 和 graph。
+仅删除 `DCP * PCP == 1` 校验会把不完整 metadata 送入错误 rank，不能作为实现。
+
 ## 本次复核交付范围
 
 本次根据最新实验包更新此分析文档，没有修改实验分支、运行代码、端口分配、采集器或启动脚本。

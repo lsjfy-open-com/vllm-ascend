@@ -4,6 +4,9 @@
 **P DCP=8 / D DCP=8** 下的失败，并给出可评审的控制面、数据面、时序和
 逻辑/物理内存方案。当前只做设计，不直接修改运行代码。
 
+Host pool、connector、offload manager 的文件级实施与联合验证步骤见
+[`blockwise_dcp_offload_implementation_plan.md`](blockwise_dcp_offload_implementation_plan.md)。
+
 基线：vLLM Ascend 0.25rc1、GLM-5.2 W8A8、Mooncake 0.3.13、
 `MooncakeConnector + dsa_pd_offload`、Decode fused offload。
 

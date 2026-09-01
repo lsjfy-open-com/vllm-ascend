@@ -167,10 +167,10 @@ D 服务：prefill_context_parallel_size = 1
 PCP 会增加 Prefill 的执行 ranks；DCP 复用 TP ranks。`additional_config.enable_dsa_cp` 是另一条
 DSA-CP 机制，不能与 PCP 或 blockwise PD connector 的 DSA 名称混为一谈。
 
-shichang 当前实验脚本并没有打开 CP：P/D 都传 `--prefill-context-parallel-size 1`，
-并把名为 `PREFILL_DCP_SIZE` / `DECODE_DCP_SIZE` 的变量作为
-`--decode-context-parallel-size 1` 传入。**size=1 是单 rank，即关闭；“对称 DCP=1”不是开了 DCP。**
-P 脚本中的 `PREFILL_DCP_SIZE` 只是变量名，不是 PCP。D 脚本还设置 `enable_dsa_cp=false`。
+实验脚本默认没有打开 CP：P/D 都传 `--prefill-context-parallel-size 1`，并把
+`PREFILL_DCP_SIZE` / `DECODE_DCP_SIZE` 默认设为 1。**size=1 是单 rank，即关闭；
+“对称 DCP=1”不是开了 DCP。** P 脚本中的 `PREFILL_DCP_SIZE` 只是变量名，不是 PCP。
+最新实验用环境变量把 P 的这个值覆盖为 8，D 仍为 1；两侧仍设置 `enable_dsa_cp=false`。
 
 ### 当前 blockwise DSA 代码为何不支持 CP>1
 
@@ -204,3 +204,81 @@ if dcp_size * pcp_size != 1:
 本次根据最新实验包更新此分析文档，没有修改实验分支、运行代码、端口分配、采集器或启动脚本。
 已核对 Git 树差异、实际归档脚本、最新三侧 facts 和 `TEST_PD_OK` 判据。
 实机成功是实验方提供的结果；本地没有 NPU，未独立复现。
+
+## 7. 2026-09-01 0831 实验仓最新同步
+
+实验分支已从 `a104e91a0` 更新到 `a399aa36a`。新增结果覆盖 P DCP=8 / D DCP=1，
+以及在该配置上叠加 MTP。生产代码名义基线仍是 `d1bf0bad2`，但本轮 collect facts 明确记录
+`dirty=true`、`matches_reviewed_experiment=false`；因此它不是原提交天然具备的非对称 DCP 能力。
+
+### 7.1 实际验证矩阵
+
+| 配方 | 结果 | 解释 |
+| --- | --- | --- |
+| P DCP=8 / D DCP=8，MTP 关 | Decode 起服失败 | `sfa_kv_offload.enable_cp()` 在模型加载阶段显式拒绝 Decode CP；尚未进入 connector 请求传输 |
+| P DCP=8 / D DCP=1，MTP 关，原代码 | 两侧 Ready；首请求失败 | DSA receive 检测到 source 物理覆盖为 8、destination 覆盖为 1，拒绝不完整映射 |
+| P DCP=8 / D DCP=1，MTP 关，现场补丁 | smoke、5 个字符串断言、4 档 ladder 均完成 | 证明补丁后服务可运行；不能证明八个 CP 分片均被正确传输 |
+| P DCP=8 / D DCP=1，MTP P1/D3，同一现场补丁 | smoke 完成、5 个字符串断言完成、4 档 ladder 全部请求完成 | 证明在现场补丁上叠加 MTP 后 API 与负载链路可运行 |
+
+对称 8/8 与非对称 8/1 暴露的是两个独立门槛：前者先被 Decode offload 的 CP 硬拒绝挡住，
+后者越过起服后在 blockwise DSA 物理页覆盖检查失败。不能用 P8/D1 的通过替代 D8 offload 验证。
+
+### 7.2 非对称临时补丁存在数据完整性风险
+
+实验脚本 `_tmp_patch_dsa_asymmetric_dcp.py` 把原来的“source/destination 物理覆盖必须相等”改为：
+
+```python
+n = min(len(source_physical), len(destination_physical))
+for source_id, destination_id in zip(source_physical[:n], destination_physical[:n]):
+    # transfer one overlapping page
+```
+
+已记录的失败现场是 `remote_scale=8`、`local_scale=1`，两侧都只有一个逻辑 block ID。
+这意味着补丁只安排一个物理页传输，其余七个 source physical pages 没有 destination，也没有被传输。
+如果 P 的八个物理页代表 DCP 拆分后的不同序列内容，D DCP=1 必须重组全部分片；静默取交集会把
+“metadata 不兼容”变成“请求可返回但缓存可能不完整”。当前结果没有提供八个 source shards 的
+逐分片覆盖计数或 Main/Indexer 校验和，不能排除 Decode 使用部分 KV、回退计算或测试未触及缺页。
+
+因此当前结论应写成：**P8/D1 在临时截断补丁上完成了功能与负载冒烟**，不能写成
+“`d1bf0bad2` 已支持非对称 DCP”，也不能把该补丁直接迁入正式分支。
+
+正式实现应按组件区分语义：
+
+- replicated Indexer 可从一个明确的 P CP source 拉一份，但必须验证它在各 CP rank 等价；
+- sharded Main KV 必须从全部 P CP sources 收齐并写入 D 的完整 Host 视图；
+- 每个 source endpoint 都要有独立完成和释放语义；
+- 若一张 D 物理页无法容纳八张 P 物理页，应先修正逻辑 block、页长和 destination allocation，
+  而不是截断列表。
+
+### 7.3 “精度 5/5”的边界比报告标题更窄
+
+`accuracy_pd.sh` 的五个 case 是对返回文本做期望子串检查。它能发现请求失败或完全偏离预期，
+但不是 token 对齐、logits 对齐或模型基准精度。归档摘要还显示部分 case 虽命中期望子串，输出质量
+并不稳定。出于日志脱敏要求，本复核不复制 prompt、生成文本或 token IDs。
+
+后续至少增加以下不含原文的白名单指标：
+
+- 与 DCP=1 基线逐 token 比较的首次分歧位置、匹配 token 数和总 token 数；
+- 每个 P CP source 的 Main/Indexer 计划页数、完成页数和 byte 数，仅报计数；
+- D 端目标区域覆盖率、重叠写计数和缺口计数；
+- MTP candidate、accepted、rejected 和 fallback 汇总；
+- 长度跨越 1、2、8 个物理页边界的固定合成用例。
+
+### 7.4 性能结果只能作为当前组合配方观测
+
+P8/D1+MTP 四档均完成：512→256 C4 为 TTFT p50 1.054s、TPOT p50 36.7ms；
+2k→256 C4 为 2.007s、59.7ms；4k→256 C8 为 3.497s、60.2ms；
+1k→512 C4 为 1.464s、40.7ms。TTFT 是包含 Prefill、KV 传输和 Decode 首 token 的 PD 端到端口径。
+
+这些数值不能直接解释为 DCP 或 MTP 的收益。P8/D1 无 MTP 与当前正式 DCP=1 基线并非严格单变量
+同轮实验；MTP 接受率只在一次 smoke 中出现，且样本不足。更关键的是，传输截断可能减少实际搬运
+字节并造成虚假的性能改善。先验证缓存覆盖完整性，再做 DCP=1、P8/D1 和 P8/D1+MTP 的同轮对照。
+
+### 7.5 实验包的脱敏边界需要收紧
+
+0831 仓新增的部分 `logs_summary` 文件仍包含生成文本；实验脚本还保留内部 IP 和绝对路径。
+这不符合“只能外传关键片段和分析”的约束。后续发布实验包时应只保留 pass/fail、计数、分位数、
+错误码、commit/dirty 和配置枚举，并在发布前扫描 URL、IP、绝对路径、prompt、completion、token ID、
+block ID 和地址。当前复核文档没有复制这些内容。
+
+本节复核的实验分支 tip 为 `a399aa36aeb08ede7c789274c43de19549fa689d`。

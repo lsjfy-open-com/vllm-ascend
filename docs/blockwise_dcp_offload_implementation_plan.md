@@ -255,6 +255,39 @@ AscendSFADCPKVOffloadImpl
 - global top-k 到 local Main 的 remap；
 - partial output + LSE merge。
 
+D 侧真 DCP 的缓存和计算关系为：
+
+```mermaid
+flowchart LR
+    H[TP0 fan-in 后的 shared Host Main] --> M0[D0 local Main shard 0]
+    H --> M1[D1 local Main shard 1]
+    H --> MX[...]
+    H --> M7[D7 local Main shard 7]
+    I[replicated Indexer] --> D0[D0: global top-k]
+    I --> D1[D1: global top-k]
+    I --> D7[D7: global top-k]
+    D0 --> M0
+    D1 --> M1
+    D7 --> M7
+```
+
+```mermaid
+flowchart LR
+    Q[DCP query gather] --> T[replicated Indexer global top-k]
+    T --> R[按 CP owner remap/compact]
+    R --> A[各 rank local SFA]
+    A --> L[partial output + LSE]
+    L --> O[DCP collective merge]
+```
+
+TP0 owner 约束的是 **Prefill Main 的写入与注册**，不要求 DCP attention 读取完整 Main。fan-in
+完成后，各 D rank 可以在同一 shared segment 上构造只覆盖本 owner shard 的 local view。
+
+Decode 新 token 的 Main 写入还要明确 writer 合同：若各 DCP rank 生成的当前 K/V 已证明等价，TP0
+可继续按 global slot 单写；否则必须由 token owner rank 写自己的不重叠 shard，并升级为多 writer
+注册/屏障。实现前先在实验机比较各 rank 当前 K/V 的 shape、dtype 和内容一致性，只上传一致性
+布尔值，不能直接沿用“TP 间天然 replicated”的旧注释。
+
 当前 fused overlap Main 算子只提供最终 attention output，缺少 partial output + LSE 合同。因此有
 两个评审选项：
 

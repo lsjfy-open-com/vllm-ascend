@@ -41,7 +41,7 @@ operator membership 的偏移/stride，并校验 CPU、dtype、shape、连续性
 | 文件 | 修改范围 | 行数与影响 |
 | --- | --- | --- |
 | [mooncake_connector.py](../vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py) | `MooncakeAgentMetadata`、`register_kv_caches` / `_build_dsa_local_layouts`、scheduler 组号发布/读取、receiver `_get_remote_metadata` / `_execute_dsa_receive` / `_build_dsa_transfer_lists` | +81/-22；改变 DSA 握手描述与请求接收时的地址匹配、完整性校验；没有重新实现 MTP 推理 |
-| [mooncake_dsa_layout.py](../vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_dsa_layout.py) | 新增 `dsa_cache_key`、`add_dsa_cache_descriptor`、`project_dsa_remote_arrays`、`infer_dsa_block_group_ids` / `select_dsa_block_groups` | +140；纯 CPU 元数据处理，分清缓存身份和 block 组号；不分配 KV 大池、不发起 TE 传输 |
+| [mooncake_dsa_layout.py](../vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_dsa_layout.py) | 新增 `dsa_cache_key`、`add_dsa_cache_descriptor`、`project_dsa_remote_arrays`、`infer_dsa_block_group_ids` / `select_dsa_block_groups` | +140；纯 CPU 元数据处理，分清缓存身份和 block 组号；不分配 KV 大池、不发起 TransferEngine 传输 |
 | [test_mooncake_dsa_mtp_layout.py](../tests/ut/kv_offload/test_mooncake_dsa_mtp_layout.py) | 新增身份、分组、覆盖范围、失败终态及握手兼容回归 | +375；验证协议/映射逻辑，不代替实机生成测试 |
 | [test_mooncake_dsa_shared_pool.py](../tests/ut/kv_offload/test_mooncake_dsa_shared_pool.py) | 补充现有夹具的层数和布局元数据 | +5；适配新字段，无生产行为变更 |
 | 本文档 | 设计、限制、验收和批注答复 | 代码补丁时 +140；本次继续补充说明 |
@@ -127,12 +127,12 @@ flowchart TD
     B --> C["握手并校验 Main / Indexer 布局"]
     C -->|通过| D["读取本 rank 的 Indexer"]
     C -->|布局异常| E["错误队列 → worker 抛错；中止"]
-    D -->|TE 返回负值| F["本 rank：TRANSFER_FAILED"]
+    D -->|TransferEngine 返回负值| F["本 rank：TRANSFER_FAILED"]
     D -->|成功| G{"D TP0 owner？"}
     G -->|是| H["读取 Main 到共享 Host pool"]
     G -->|否| I["本 rank：RECEIVE_COMPLETE"]
     H -->|成功| I
-    H -->|TE 返回负值| F
+    H -->|TransferEngine 返回负值| F
     F --> J["scheduler 收齐所有预期 TP rank 的结果"]
     I --> J
     J -->|全部成功| K["接收完成，继续计算"]
@@ -152,7 +152,7 @@ scheduler 的 `build_connector_meta` / `update_connector_output`。
 - 一个目标行只有部分有效 page 是允许的；拒绝的是实际源 pages 超过目标容量。
 - `RECEIVE_COMPLETE` 仍在两条所需传输腿完成后产生；非 owner 只拉自己的 Indexer。
 - `DONE_RECVING_MSG` 是释放 P 源 blocks 的通知，失败清理也会发送，不能当作成功证据。
-  TE 返回负值仍走已有 `TRANSFER_FAILED` / 重算流程；布局校验异常走已有错误队列，明确中止，
+  TransferEngine 返回负值仍走已有 `TRANSFER_FAILED` / 重算流程；布局校验异常走已有错误队列，明确中止，
   不伪装成接收成功。
 
 ## 兼容性与未覆盖范围
@@ -260,7 +260,7 @@ sequenceDiagram
 拼到 D 的 prompt；D 接收的是原始生成请求及缓存信息，由 vLLM 自己处理可复用前缀与剩余计算。
 P 返回 HTTP 并不自动证明异步 MTP 的所有设备写入都已完成，这仍需实机验证源发布时序。
 
-实际 KV 字节在 P/D 的 Mooncake TE 之间传输，不经过 proxy。若实验机采用自定义代理，
+实际 KV 字节在 P/D 的 Mooncake TransferEngine 之间传输，不经过 proxy。若实验机采用自定义代理，
 无需只为文件名切换，但必须具有上述 P 先完成、完整转交元数据的协议。
 不能用字段白名单漏掉 `dsa_block_group_ids` 等扩展。
 
@@ -401,7 +401,7 @@ B 失败时，可以降到 P/D 都 1 步，区分初次 draft 与多步迭代；
 需要定位异步或 P/D 步数差异时，再改变一个因素。C 失败时，才拆 P 图/D eager、
 P eager/D 图，或固定更小 batch。不得一次切 MC2、量化、overlap 和 MTP 步数。
 
-缺失描述符、组件数错误、覆盖不足、TE 返回负值先用上述 UT 注入，
+缺失描述符、组件数错误、覆盖不足、TransferEngine 返回负值先用上述 UT 注入，
 不要求每组 NPU 服务重复故障注入。真实链路中断/取消的资源回收仍是后续集成验收项，UT 不能替代。
 
 ### 3. 发布前只补一轮实际使用场景
@@ -414,6 +414,178 @@ B/C 通过后，针对计划上线的 prefix cache、chunked prefill、长生成
 日志仅在机内处理。允许外传版本/提交、开关、层数、组数、dtype/shape、测试计数及脱敏分析。
 不外传完整日志、prompt、输出文本、token/block IDs、地址、IP、路径、请求标识或凭据。
 不能把原始日志交给外部 agent 后再让其过滤。
+
+## 非对称 DCP / PCP 支持设计
+
+### 先纠正 PR #14836 的范围
+
+官方 [vllm-ascend PR #14836](https://github.com/vllm-project/vllm-ascend/pull/14836)
+支持的是 **Prefill 开 DCP、Decode 关 DCP**：
+
+```text
+P: prefill_context_parallel_size = 1
+   decode_context_parallel_size = N (>1)
+D: prefill_context_parallel_size = 1
+   decode_context_parallel_size = 1
+```
+
+它不是 P 开 PCP、D 开 DCP。PR 的生产改动很小，核心是：当本地 D 没开 DCP，
+但远端 P 的 `remote_dcp_size > 1` 且模型使用 SFA sparse 时，D 仍生成 replicated Indexer
+block IDs；传输时按 `AscendSFAIndexerCacheSpec` 选择这组 IDs，普通 MLA KV 不误用它。
+前置 CP block/group 映射来自 [PR #13965](https://github.com/vllm-project/vllm-ascend/pull/13965)。
+[v0.26rc backport PR #14958](https://github.com/vllm-project/vllm-ascend/pull/14958)
+也明确写成 Prefill DCP=2 / Decode DCP=1，并保留 `remote_cp % local_cp == 0`。
+
+shichang 的 P 脚本使用 `PREFILL_DCP_SIZE` 生成 `--decode-context-parallel-size`，
+命名虽容易误解，方向上与 #14836 一致。当前值为 1，因此尚未开启。
+
+### 为什么不能直接移植 #14836 的几行代码
+
+`#14836` 修改普通 `MooncakeConnectorMetadata` 的 Pull 路径：
+
+```text
+ReqMeta(remote_pcp_size / remote_dcp_size)
+  → _get_kv_split_metadata
+  → _get_sfa_replicate_k_block_ids
+  → _transfer_kv_cache_all_groups
+```
+
+blockwise DSA 使用另一条控制流：
+
+```text
+RemoteSource
+  → DsaStepRequest / DsaConnectorMetadata
+  → _start_dsa_commands
+  → _dispatch_dsa_commands
+  → Indexer D2D + Main D2RH
+```
+
+当前 `RemoteSource` 只有一个 Main block 列表、一个 Indexer block 列表和按 P TP rank
+排列的 endpoint；`_dispatch_dsa_commands` 每个 D TP rank 只选一个 P TP leader。它没有
+`remote_dcp_size`、CP shard、virtual/physical block 映射或 replicated Indexer 语义。
+因此 #14836 的条件即使加到普通函数里，DSA 请求也不会执行到那里。
+
+### 推荐范围：先做 P-DCP=N / D-DCP=1
+
+第一阶段只声明下面的支持范围：
+
+- P PCP=1、P DCP=N；D PCP=1、D DCP=1；
+- P/D TP 相同、PP=1、block size 相同；GLM-5.2 首轮令 P DCP=TP；
+- Main 为 DCP sequence-sharded source，D 侧组装到完整共享 Host pool；
+- SFA Indexer 在 P 的 DCP ranks 上 replicated，D 每个目标 TP rank只拉一份；
+- MTP 先关闭验证 CP，之后恢复 P1/D3；target graph 最后恢复。
+
+这比同时实现 PCP 小很多。真正 PCP 会增加 P world size，并牵涉 MRV2 prefill token 分片、
+TP×PCP endpoint、全局顺序恢复和 P/D+SFA 兼容；#14836 没有这些能力。当前官方 PCP
+支持矩阵也不能作为 rc1 blockwise DSA 的现成实现。PCP 应作为下一项独立设计。
+
+### 生产代码设计
+
+#### 1. 抽出 CP 传输规划器
+
+从普通 Mooncake `_get_local_remote_cp_params` / `_get_kv_split_metadata` 的已验证语义中
+抽取纯 CPU planner，输入为：
+
+- remote/local PCP、DCP size/rank；
+- P/D block size、prompt blocks、prefix-computed tokens；
+- logical KV group 与 transfer group 的对应关系；
+- 组件类型（Main 或 SFA Indexer）和源/目标 block IDs；
+- P TP endpoints 及目标 D TP rank。
+
+输出为不可变的 `DsaCpTransferPlan`：若干 `DsaCpSourceShard`，每个 shard 明确 endpoint、
+remote CP rank、组件、源物理 block/byte ranges 和目标 block/byte ranges。planner 不接触
+Mooncake engine、NPU tensor 或全局状态。普通路径是否立刻复用可后定，但两条路径必须共享
+同一组 CP 几何校验，不能复制两套公式。
+
+初始约束为 `remote_cp_size % local_cp_size == 0`；本阶段 local=1。block size 不同时先拒绝，
+后续再复用官方整除约束。请求 metadata 中的 block IDs 是 logical KV group 维度，不能用
+Mooncake transfer-group index直接索引；SFA scale=8 和 Main scale=1 必须保留各自物理 plane。
+
+#### 2. 扩展 DSA metadata，而不是复用一个 leader
+
+在 `mooncake_dsa_metadata.py` 中版本化扩展：
+
+```text
+RemoteSource
+  remote_dcp_size / remote_pcp_size / remote_block_size
+  endpoints_by_prefill_rank
+  main/indexer logical block groups
+
+DsaStepRequest
+  cp_transfer_plan: tuple[DsaCpSourceShard, ...]
+```
+
+P scheduler 发布实际 CP geometry、prompt/prefix 范围和所有需要的 P TP endpoint。
+D scheduler 在分配本地 Main Host / Indexer HBM blocks 后调用 planner，worker 只执行计划。
+旧 metadata 保留 CP=1 解码入口；P/D CP>1 必须双方使用新协议版本，不能猜测。
+
+DCP 复用 TP ranks，不一定增加 endpoint 数量，但一个 D 目标 rank需要从多个 P DCP shards
+组合 sequence。endpoint 选择必须来自计划，不能继续只算
+`leader_rank = d_tp_rank * (P_TP / D_TP)`。
+
+#### 3. Main 和 Indexer 分开规划
+
+- **Main D2RH**：P DCP=N 时源序列分散在 N 个 DCP shard。D TP0 作为共享 Host owner，
+  拉取所有属于目标完整序列的 shard，并按全局 token 顺序写入 DCP=1 Host blocks。其他 D TP
+  不重复写 Main，但要等待 owner 的 Main phase 结果。
+- **Indexer D2D**：GLM-5.2 SFA Indexer 在 P DCP ranks 上 replicated。每个 D TP rank只从
+  一个与其 TP/cache identity 匹配的 P endpoint 拉一份，不能像 Main 一样合并 N 份。这里采用
+  #14836 的原则：是否拉 replicated Indexer由源布局和 `AscendSFAIndexerCacheSpec` 决定，
+  不能只看本地 DCP flag。
+- **MTP**：target 与 MTP 的 Main/Indexer 分别使用缓存身份；先在无 MTP 下验证 CP planner，
+  再恢复 P1/D3，不能用 speculative step 数推导物理层或 CP shard 数。
+
+#### 4. 完成、失败和源释放
+
+一个本地 rank 的 `RECEIVE_COMPLETE` 必须覆盖计划内所有 required shards：
+
+```text
+Indexer required shards 完成
++ owner 的全部 Main shards 完成（非 owner 等待共享结果）
+= 本 rank 成功
+```
+
+任意 shard TransferEngine 失败要记录 `component + remote_cp_rank` 并触发当前本地重算路径。
+布局/整除/覆盖错误在 I/O 前失败。`DONE_RECVING_MSG` 要发送给实际参与的每个 P source
+endpoint，并在该 endpoint 的所有 shard 结束后发送；不能只通知原 leader，否则其他 P DCP rank
+的源 blocks可能提前释放或泄漏。取消路径同样遵守这一引用计数。
+
+#### 5. 解除校验的条件
+
+只有完成上述协议和测试后，才把 Decode 的硬限制从：
+
+```text
+DCP * PCP == 1
+```
+
+改为明确支持矩阵。第一阶段可允许 `P_DCP % D_DCP == 0` 且 `D_DCP=1`、两侧 PCP=1；
+不要直接删除校验。P/D 的 `prefill` / `decode` topology 配置也要增加 CP 字段，并核对本地角色
+的实际配置，避免启动脚本写了 N 而 connector仍按 1 规划。
+
+### 文件范围
+
+| 文件 | 修改 |
+| --- | --- |
+| `mooncake_dsa_metadata.py` | CP topology、source shard、versioned command 和严格校验 |
+| `mooncake_connector.py` | P 发布 CP metadata；D scheduler 调 planner；worker 多 source 执行、聚合、释放 |
+| 新的纯 planner 模块 | logical/physical block 与 CP shard 映射，不导入 torch/vLLM runtime |
+| `test_mooncake_dsa_*` | planner、metadata、Main/Indexer 分流、失败和释放回归 |
+| 实验脚本 | P `DCP=N`、D `DCP=1`；名称改成 `P_DCP_SIZE`，避免误称 PCP |
+
+无需修改 ModelRunner、权重加载、量化算子或引入环境变量。若实现过程中发现必须改
+ModelRunner 才能得到 block mapping，应先停下来做架构复核，而不是把映射逻辑散进 runner。
+
+### 最小验证顺序
+
+1. **纯 UT**：P8/D1，Main 收齐 8 shards、Indexer只取 1 份；跨 block、partial tail、prefix hit、
+   SFA/Main 不同 scale、缺 shard、重复 shard、TransferEngine 失败、取消与每 endpoint 释放。
+2. **无 MTP eager**：P DCP=8 / D DCP=1，与当前 P1/D1 基线做固定精度小集；确认真实
+   Main/Indexer shard 计数，不接受一直本地重算。
+3. **MTP eager**：恢复 P1/D3，检查 target/MTP 组件与 speculative 接受/拒绝汇总。
+4. **target graph**：恢复 `FULL_DECODE_ONLY`，多轮 replay 后跑精度和并发 4 小压测。
+5. **扩范围才加矩阵**：prefix cache、chunked prefill、不同 block size、D_DCP>1。
+
+每一步只改变一个维度。首轮不把 PCP、DCP 双侧>1、MTP、graph 和 prefix cache 一次全开。
 
 ## 本机验证记录
 

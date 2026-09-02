@@ -896,3 +896,122 @@ P8/D1 正是 `source_cp_size=8`、`destination_cp_size=1`；P8/D8 才是两者�
 因此正确实现是“配置驱动的固定容量 + 请求驱动的动态页映射”，不是为每个 prompt 动态申请一块新的
 Host 内存。UT 中可以使用 128/8/1024 作为一个具体用例，但还必须参数化覆盖 DCP1/2/8 和 backend
 支持的其它 block sizes；生产路径只能读取 config、KV spec 和 handshake。
+
+## 15. 2026-09-02：`214c48677`、实验实现与当前方案对齐
+
+### 15.1 三套方案其实在解决不同层的问题
+
+同事提交 `214c48677` 的核心判断是正确的：普通 Mooncake 路径已经有 `ReqMeta`、
+`_get_kv_split_metadata()`、`_get_group_pulls_metadata()`、
+`_get_sfa_replicate_k_block_ids()` 和 `remote_port_send_num`，DSA 不应另造一套 CP/TP 拆分和 endpoint
+完成计数。DSA 的特有差异应尽量只保留在**目标地址平面**：Indexer 写 Decode NPU，Main 写 Decode
+shared Host segment。
+
+但这份设计主要回答“由哪个 Decode rank 从哪些 Prefill endpoints 拉哪些 blocks”，没有完整回答
+“通用 helper 给出的 destination block id 在 shared Host segment 中到底代表 128-token Host page，还是
+DCP8 下 1024-token scheduler virtual block”。因此它解决了拓扑和任务拆分，还没有单独关闭本轮
+`need=17, got=3` 的 block namespace 问题。第 8 步所说“目标 block 不重叠”目前是实现必须证明的
+前置条件，不能仅由通用 split metadata 推定。
+
+三套方案的差异如下：
+
+| 维度 | `214c48677` 同事设计 | 0831 实验实现 `54ea583e7` + `0c42eca33` + `a2c194b59` | 本文此前方案 |
+| --- | --- | --- | --- |
+| 远端拓扑 | 复用完整 `ReqMeta` | 自建 `RemoteSource`，只补 remote DCP/PCP | 曾建议扩展 `RemoteEndpoint/DsaSourceShard` |
+| TP/CP 拆分 | 复用社区三个 helper | DSA 自己用 `leader_rank`，TP0 再遍历 CP endpoints | 显式 planner，自行做 coverage |
+| Main writer | 一开始就是多 DTP writer | TP0 单 writer | 当前阶段 TP0 单 writer，后续才多 writer |
+| Host block 差异 | 没有给出物理页落点算法 | Decode host-offload 时把 scheduler block 粒度改成 Host page 粒度 | 建议独立 `scheduler block → Host pages` adapter/reservation |
+| Host pool | TP0 create/expand/release，所有 DTP 注册同一段 | TP0 create/register/write，其他 ranks 不写 Main | 保持现有 pool，当前 TP0 register/write |
+| 完成与释放 | 复用 `remote_port_send_num`/DONE 计数 | DSA `finally` 发送 `DONE ... {}`，Main 额外 endpoints 未纳入计数 | 曾建议新 lease/coverage 状态；当前应优先复用已有计数 |
+| PCP/任意 TP 比例 | 目标是所有现有合法组合 | `prefill_rank_for_cp_rank()` 明确只支持 PCP=1，并取每组首个 replica | 当前主要围绕 P8/D1、P8/D8 |
+| 修改范围 | connector + 非 TP0 Host registration | connector + DSA metadata + **平台 scheduler/coordinator patch** | connector/reader adapter；若另建映射会更大 |
+
+因此我们和同事方案的总体思路一致，但本文此前对控制面设计得偏重：如果现有 `ReqMeta` 和 port
+计数能承载 DSA，就不应再增加平行的 endpoint、lease 和完成协议。本文需要保留的是 coverage
+门禁与 Host 目标地址适配，不是再造一套通用拓扑模型。
+
+### 15.2 实验机采用的是“统一 block id 口径”，不是额外 Host 映射表
+
+实验机最新两次修复采用了更小的实现方式：当 Decode 开启 Host offload 时，
+`_ascend_resolve_kv_cache_block_sizes()` 不再把 scheduler block size 乘以 DCP×PCP。以本轮配置为例：
+
+```text
+修改前：scheduler id 粒度 = 128 × 8 = 1024 tokens，2060 tokens 只分到 3 ids
+修改后：scheduler id 粒度 = 128 tokens，2060 tokens 分到 17 ids
+```
+
+于是 `main_host_block_ids` 可以直接作为 Host physical page IDs 使用，writer 和 reader 理论上继续使用
+同一组已有 block IDs，不需要新建 `scheduler_block_id → host_page_ids` 表。这比第 14.5 节的独立页
+allocator/mapping 更贴近用户要求的“小范围、复用已有接口”。如果端到端证明 Indexer、prefix cache、
+MTP 和 graph 都仍使用一致口径，应优先保留这种方式。
+
+不过 `a2c194b59` 当前的 fallback 判定仍有明显扩大影响面的风险：只要
+`additional_config.kv_offload_decode_config.enabled=True`，即使 group wrapper 没暴露 `store_on_host`，
+整个 Decode engine 的公共 scheduler block size 都退回 128。对应 UT 甚至显式验证一个普通 hybrid
+group 在该 flag 下也从 `16×8` 变成 `16`。scheduler block size 本来就是多 KV groups 共用的全局值，
+所以这不是只改 Main 的局部行为；必须补证据说明：
+
+1. Indexer manager 接收到更多 scheduler IDs 后，内部 effective block、block table 和 slot mapping 仍正确；
+2. prefix cache 的 hash block size、命中长度和回收边界没有按旧的 DCP virtual span 解释；
+3. MTP 主模型与 draft model 使用同一 scheduler ID 粒度；
+4. 非 DSA 的 `kv_offload_decode_config` 使用者不会被误命中；
+5. `UniformTypeKVCacheSpecs` 中真实的 Host member 能被稳定识别，尽量删除仅凭全局配置开启的宽泛
+   fallback。
+
+这次实验补丁还没有改变原来的 DSA 控制路径：`_dispatch_dsa_commands()` 仍用 `leader_rank`，TP0 的
+`_dsa_gather_main_unified_view()` 再串行遍历 P CP ranks；`_execute_dsa_receive()` 仍发送空的
+`remote_port_send_num`。因此它解决了 Host block 数量，但没有吸收同事方案的通用拓扑和源端延迟释放
+能力。
+
+### 15.3 建议合并成两阶段，而不是三选一
+
+```mermaid
+flowchart LR
+    R[现有 ReqMeta] --> S[社区 split/group-pull helpers]
+    S --> I[Indexer D2D plans]
+    S --> M[Main D2RH plans]
+    M --> O[阶段一: TP0 执行全部 Main plans]
+    O --> H[现有 shared Host pool]
+    I --> C[复用 endpoint 完成计数]
+    H --> C
+    C --> G[coverage 完整后 READABLE/DONE]
+    M -.正确性全过后.-> W[阶段二: plans 分发给多个 DTP writers]
+    W --> H
+```
+
+阶段一应组合三方各自最小且已经有依据的部分：
+
+1. **采用同事方案的控制面**：DSA 请求尽量复用 `ReqMeta`、split/group-pull 和
+   `remote_port_send_num`，删除 `leader_rank` 的一对一路由；不要新增第二套 topology/state 数据结构。
+2. **保持实验机的 TP0 owner/writer**：通用 helper 可以先生成多个 Main subtasks，但全部交给 TP0
+   执行。这样先获得任意合法 P/D TP-DCP 拆分能力，同时不引入共享段多 writer 一致性。
+3. **有条件采用实验机的 Host-page scheduler 粒度**：它可以消除新 Host mapping 表，但要把触发条件
+   收紧到真实 DSA Host Main layout，并完成上面的 Indexer/prefix/MTP 回归。若无法做到局部且一致，才
+   回到第 14.5 节的薄 adapter；不预先实现新的 Host pool allocator。
+4. **保留本文的 fail-closed 校验**：`dest_index` 越界不能 `continue`，Main 必须验证 planned/completed
+   pages 和 bytes；remote address 必须使用 handshake stride，不能丢弃 `remote_strides`。
+5. **复用已有释放计数**：先证明 `remote_port_send_num` 能覆盖同一 P endpoint 的 Indexer consumer 和
+   TP0 Main consumer。只有现有机制表达不了失败/取消时，才增加最小的 request-level aggregate 状态，
+   不先引入完整新状态机。
+
+阶段二才采用同事方案的多 DTP writer：TP0 仍独占 segment create/release，每个 DTP 只注册自己的
+Transfer Engine view 并执行已经生成的互斥 Main ranges。进入该阶段前必须用地址区间而不只是 block
+ID 证明：`union(actual ranges) == expected ranges` 且无 overlap、无越界；否则在 shared segment 中，
+多个 rank 的“本地 block id 相同”可能落到同一个 Host 地址。
+
+### 15.4 当前应如何评价实验状态
+
+`a2c194b59` 是针对一手异常的合理小补丁方向，但其文档只记录了 fallback 加入，尚未记录 fallback
+后的 P8/D8+MTP 标准 aisbench 结果。因此现在可以进入实验，不能把它标记为已经闭环。建议本轮只验证
+TP0 writer，并按以下顺序判断是否保留 scheduler 粒度方案：
+
+1. P1/D1 与 P8/D1 回归；
+2. P8/D8、MTP0、eager，覆盖 127/128/129、1023/1024/1025 和 2k；
+3. 同配置打开 MTP3，再开图；
+4. prefix cache 0/部分/完整命中；
+5. 并发下验证 source block 不会在 TP0 拉 Main 前释放；
+6. 机内逐 token 与本地计算基线对齐后，才记录性能并开始多 writer。
+
+若第 2 步仍在 reader/attention 出现首 token 分歧，说明“让 scheduler 多分 Host-page IDs”只解决了
+容量，Indexer 或 SFA DCP reader 仍按 virtual block 解释，此时再加薄的 group-specific adapter；不要
+通过继续扩大平台级 flag patch 掩盖口径差异。

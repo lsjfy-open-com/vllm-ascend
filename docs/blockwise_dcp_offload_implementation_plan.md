@@ -591,3 +591,145 @@ P8/D1+MTP3 的记录是 draft accept 21.1%、mean length 1.63，当前数据反�
 状态机风险的专项实验应使用至少两个并发请求，并在 D_i DONE 后、D0 拉该 rank Main 前注入延迟，
 同时迫使 P allocator 复用旧 blocks。修复前该用例应能暴露 checksum/epoch 不一致；修复后必须稳定
 fail closed 或完整通过。
+
+## 13. 2026-09-02 最新实验：P8/D8、并发排队与多 TP writer
+
+### 13.1 已经证明的范围
+
+最新 P8/D8、DCP=8、MTP=0、FULL graph 的结果证明 Decode 和 Prefill 都能 Ready，短 smoke 返回
+HTTP 200，精度样例 5/5。Prefill 最初使用 20520/20720 端口时的 `Address already in use` 是残留
+ZMQ 端口冲突，改为 22020 后恢复，不能归因于 DCP 数据面。
+
+但同一轮 UNIQUE ladder 的 512/2k/4k/1k 四档均为 HTTP 200 后 `no text chunk in stream`。所以当前
+结论只能是“P8/D8 能启动并完成部分短请求”，不能标记为端到端通过。短 smoke 的非流式响应里
+`content` 可能为空而 `reasoning` 有内容，现有 ladder 又只报告“无 text chunk”，因此这里还存在两种
+需要用原始 SSE 区分的情况：
+
+1. engine 已经生成 token，只是流式事件把文本放在 `reasoning_content`，客户端只解析 `content`；
+2. engine 没有产生输出 token，或首步就错误结束，HTTP 200 只是协议层成功。
+
+下一轮对同一个固定 UNIQUE prompt，分别保存 P8/D1 与 P8/D8 的**脱敏事件结构**：每个 SSE event 的
+序号、字段名、各字段长度、`finish_reason`、usage 和 engine 侧 output-token 计数。无需上传文本内容。
+若 engine token 数大于 0 而客户端计数为 0，修客户端解析；若 engine token 数也是 0，则继续查
+scheduler/attention/offload state，不能用 API 解析问题掩盖数据面错误。
+
+### 13.2 P8/D8 的代码风险与修改顺序
+
+目前 `sfa_kv_offload.py` 的变化主要是解除 CP guard。解除限制不等于实现了 offload backend 与 SFA
+CP 语义的组合，仍需检查以下接口闭环：
+
+| 风险 | 当前迹象 | 建议修改/验证 |
+| --- | --- | --- |
+| CP block mapping 未进入 reader | reader 仍直接消费原 `block_table` | 在 reader 入口生成并显式传入 unified/CP-local 映射；127/128/129 与 1023/1024/1025 做逐 token 对照 |
+| Main Host 行与 DCP view 口径不同 | P8 按 8 个 128-token shard 拼成 1024-token row | 用 `layout_fingerprint` 固化 block size、CP size、K/V stride；reader 只接收相同 fingerprint |
+| SFA CP 计算没有组合 | offload backend 未见 query gather、local top-k、partial output/LSE merge 闭环 | 先走完整 shared Main 的兼容 reader 验正确性；再单独实现真 DCP 分片计算，避免同时改变传输和 attention reduction |
+| Decode 新 token 仅 TP0 写 Host | `_cpu_cache_pair()` 以 `manager.tp_rank == 0` 选择 Host K/V | 若 DCP rank 的 K/V 非复制，改成 owner-rank 分片写并做 coverage commit；若证明复制，则保留 TP0 并加断言 |
+| Indexer scale fail-open | remote/local scale 不一致时取 `min` | 改为 fingerprint 不一致直接拒绝请求；不要自动截短隐藏缺 shard |
+| P source 提前释放 | Indexer DONE 可能早于 TP0 Main pull | 按 endpoint 持有 `{INDEXER, MAIN}` lease，全局 commit/reject 后统一 release |
+
+修改应分两阶段。第一阶段保持单 writer 和 MTP=0，只修 P8/D8 的流式/reader 语义，要求固定 UNIQUE
+prompt、跨边界长 prompt、逐 token 对照全部通过。第二阶段再开启 MTP3，验证 draft/target 两套 slot
+mapping 与 commit epoch。多 TP writer 是随后独立的性能补丁，不能和第一阶段一起合入，否则首次分歧
+无法定位。
+
+### 13.3 为什么 C16 会排队，为什么 TPOT 也会变差
+
+P8/D1 长上下文测试中 Prefill 配置 `max_num_seqs=8`，而并发 C16 一次提交 16 个请求。前 8 个进入
+Prefill batch，后 8 个等待下一批，因此 C16 的 TTFT 包含确定的 Prefill admission queue。这一点与
+Host pool 是否有空位无关。
+
+当前 Main 传输还有第二层串行点：每个 Decode worker 只有一个接收线程队列，且 D TP0 对 P0～P7
+逐个执行同步 Main read。多个 Prefill batch 接近完成时，会在 TP0 Main fan-in 形成 head-of-line
+blocking；其他 D TP ranks 完成 Indexer 后处于等待。
+
+TPOT 的劣化则发生在 Decode 计算期。D 侧 `max_num_seqs=32`，所以 C16 通常不会在 scheduler admission
+处排队，但第二个 Prefill wave 到达时可能与第一批仍在 decode 的请求重叠，使活跃 decode seqs 从约
+8 增至约 16。MTP3 每个序列最多需要 `1 + num_speculative_tokens = 4` 行，因此相关 fused selection、
+LRU metadata、attention/MoE batch、Host DMA 和 HBM 带宽都会增长。
+
+最新数据也符合这个波形解释：5.2k 的 C16 TPOT 相对 C8 从约 47.0ms 升至 58.7ms；10.3k 从约
+51.2ms 升至 56.8ms；20.7k 两者都约 48.7ms。长 prompt 让两个 Prefill wave 间隔更大，第一批 Decode
+可能已接近结束，两个 wave 的 Decode 重叠反而减少。应新增时间戳验证：proxy arrival、P schedule/
+start/end、D connector enqueue/start/end、每个 CP shard transfer、coverage commit、active decode
+seqs、首 token。只有把 active seqs 与 TPOT 对齐，才能区分模型 batch 膨胀和 connector 排队。
+
+### 13.4 单 DP rank、多 seqs 的 LRU HBM 分配
+
+LRU buffer 是 worker 启动/初始化时按上限预分配的固定 HBM，不是每来一个序列再动态申请。每个
+offload layer、每个 TP worker 都有独立 K/V buffer pair；同一 DP replica 内的多序列按 row 使用不重叠
+的 slice，不会读写同一地址。
+
+```text
+max_num_topk_rows = min(max_num_batched_tokens,
+                        max_num_seqs * (1 + num_speculative_tokens))
+
+layer L / TP worker i
+  row 0       -> seq/token row 0
+  row 1       -> seq/token row 1
+  ...
+  row N-1     -> 独立 slice
+```
+
+它们会竞争相同 NPU 的 HBM 带宽、DMA、计算资源、Host 内存带宽和固定的 LRU planner threads，但不会
+竞争同一块 HBM 地址。达到 row capacity 时应由 scheduler/manager 限制，不能临时多申请。提高
+`max_num_seqs`、`max_num_batched_tokens` 或 `topk_buffer_size` 会线性增加每层、每 TP worker 的固定
+HBM 占用，可能挤压模型/KV cache。
+
+按日志中的 K/V 每 token 总计约 1152 bytes 举例，`topk_buffer_size=4096` 时一行约 4.5 MiB/层；
+MTP3 的一个活跃 seq 最多占四行，约 18 MiB/层；128 行约 576 MiB/层/TP worker。此数值只用于说明
+量级，实验机应打印实际 dtype、K/V dim、rows 和层数后再核算。
+
+### 13.5 多 TP 并行写 Host pool 的推荐数据面
+
+第一版建议改成 **D 侧多 writer pull**，暂不做 P 侧主动 push。对 P8/D1、D TP=8：DTP_i 同时从
+P_i 拉 Indexer 和 Main，并把 Main 写到 Host row 内属于 CP_i 的不重叠 128-token slice。这样可以复用
+当前 pull 协议和 Decode scheduler 的 `results_by_rank` 聚合，同时消除 TP0 对八个 source 的串行 fan-in。
+
+```mermaid
+flowchart LR
+    P0[P0: Indexer+Main shard 0] --> D0[DTP0 writer]
+    P1[P1: Indexer+Main shard 1] --> D1[DTP1 writer]
+    PX[P2 ... P7] --> DX[DTP2 ... DTP7]
+    D0 --> H0[Host final range h0]
+    D1 --> H1[Host final range h1]
+    DX --> HX[Host final ranges h2 ... h7]
+    H0 --> C[coverage + epoch commit]
+    H1 --> C
+    HX --> C
+    C --> R[READABLE]
+```
+
+这里 TP0 仍是 shared segment 的**分配和生命周期 owner**，但不再是唯一数据 writer。当前
+`DSAHostKVPool.register()` 会拒绝非 owner rank，这正是实现多 writer 前必须修改的接口：每个 D TP
+rank 要把本进程看到的 shared segment local VA 注册到自己的 Mooncake engine；segment create/close
+仍只允许 owner。退出时先让所有 rank unregister 本地 engine mapping，再由 owner 释放 segment。
+
+需要新增或扩展的接口如下：
+
+1. `host_pool.py`：拆分 `allocate_owner()`、`register_local_writer(engine)`、
+   `unregister_local_writer()`、`close_owner()`，启动时 all-gather layout fingerprint 和注册结果；
+2. planner：生成 `MainShardPlan(request_id, epoch, source_rank, writer_rank, src_blocks,
+   dst_ranges, expected_bytes)`，I/O 前证明范围不重叠、没有越界且 union 等于 expected range；
+3. worker：每个 DTP 执行自己的 Indexer+Main plan，DMA 完成后只报告 `LOCAL_DONE`，不直接向 P 发
+   DONE；
+4. coordinator：采用 `ALLOCATED → LEASED → TRANSFERRING → LOCAL_DONE →
+   COVERAGE_VALIDATED → COMMITTED/READABLE → RELEASED`；失败进入幂等 ABORT；
+5. reader：必须同时匹配 request generation、layout fingerprint 和 committed epoch，不能只看旧
+   `finished_recving` flag；
+6. 配置 `writer_count=1/2/4/8`，按 source rank 取模分配，保留 TP0 单 writer 回退。多 writer 可能先
+   饱和 Host/ROCE 带宽，因此必须实测 1/2/4/8，不默认 8 最优。
+
+P8/D8 下先不要直接套用这一补丁。应先完成 13.2 的 reader/streaming 正确性；随后可让每个 DCP/TP
+rank 写自己的 128-token slice，但 commit coverage、Decode 新 token owner 和 SFA CP reduction 必须
+采用同一 layout contract。P 侧主动 push 还要求 D 暴露远端 Host region capability、地址与写权限，
+协议和故障恢复范围更大，可作为第二阶段优化。
+
+### 13.6 合入与实验门槛
+
+1. CPU UT：plan coverage、重复 range、缺 range、越界、epoch mismatch、writer 超时和幂等 abort；
+2. P8/D8 单 writer、MTP0：原始 SSE 结构与 engine token 计数一致，跨边界逐 token 对齐 DCP1；
+3. P8/D8 单 writer、MTP3：draft/target mapping 独立校验，记录各位置条件接受率；
+4. P8/D1 多 writer：1/2/4/8 writer 的传输时间、Host/ROCE 带宽、TTFT、TPOT 和 CPU 占用；
+5. 并发 source-reuse 注入：延迟任一 writer 并强制 P allocator 复用，修复后必须等待 lease 或 fail
+   closed，不能静默输出；
+6. 最后再做 P8/D8 + MTP3 + 多 writer 组合，不把三项变量同时带入首轮定位。

@@ -3,12 +3,12 @@
 本文面向 vLLM Ascend 0.25rc1、GLM-5.2 W8A8、Mooncake 0.3.13，设计
 `MooncakeConnector + dsa_pd_offload + fused KV offload` 的 DCP 数据完整性修复。
 
-实验机已经确认 P8/D1 的短 prompt 是假阴：请求可以返回，但 Prefill 的全部 CP 分片没有传到
-Decode。本文先建立可证明完整的 Host ingress 路径，再扩展对称 DCP、MTP 和图模式。
+历史实验曾确认 P8/D1 的短 prompt 存在假阴；最新实验补丁已经通过 TP0 multi-source gather 和地址
+映射修复该主路径。本文区分当前必要的小范围修复、待验证风险和正确性通过后的性能方案。
 
 ## 1. 已确认的现状
 
-当前实现有四个直接相关的事实：
+修复前基线有四个直接相关的事实：
 
 1. `DSAHostKVPool` 每个 DP group 只创建一段 shared segment；Decode TP0 是 owner，其他 TP ranks
    映射同一段 DRAM。
@@ -17,7 +17,8 @@ Decode。本文先建立可证明完整的 Host ingress 路径，再扩展对称
 4. P8/D1 的临时补丁把八个 source physical pages 和一个 destination physical page 取最小交集，
    实际只传一页。
 
-所以目前不是“偶尔漏传”，而是协议、容量和完成条件都只表达了单 source、scale=1。
+问题核心是 source endpoint 选择和目标地址映射只覆盖了单 source；现有 Host pool 容量与 view 本身
+不需要重写。
 
 ## 2. 首期范围与非目标
 
@@ -25,16 +26,16 @@ Decode。本文先建立可证明完整的 Host ingress 路径，再扩展对称
 
 - P DCP=2/8、D DCP=1 时，Decode TP0 从全部 P CP sources 重组完整 Main Host view；
 - Decode Indexer HBM 得到完整 replicated view；
-- 少任意一页、一个 source 或一个 release ACK，请求都不能以 remote KV ready 进入 Decode；
+- TP0 的全部 source transfer 返回后，请求才能以 remote KV ready 进入 Decode；
 - 保持当前 TP0 Host owner，不在首期引入多 D writer；
 - 使用 eager、MTP 关建立 token 级正确性基线。
 
 首期不承诺对称 DCP 的 attention 计算，也不承诺性能收益。P8/D8 还需要组合 DCP metadata 与
 offload attention，不能由 connector 单独完成。
 
-## 3. Host pool：从 scale=1 改为显式 ingress layout
+## 3. Host pool：保持现有布局，只补传输地址映射
 
-### 3.1 当前容量错误
+### 3.1 当前问题是 source shard 到目标地址的映射
 
 当前 Main layout 使用：
 
@@ -42,90 +43,72 @@ offload attention，不能由 connector 单独完成。
 [num_scheduler_blocks, decode_block_size, 1, width]
 ```
 
-并强制 `tensor_blocks == kv_cache_config.num_blocks`，所以 local scale 恒为 1。P DCP=C 时，一个
-scheduler logical block 在传输握手中展开为 C 个 kernel physical pages；P8/D1 因此出现
-`remote_scale=8 / local_scale=1`。
+这个布局本身可以容纳 Decode attention 需要的完整 global Main KV，无需把 `num_blocks` 扩大 C 倍。
+P DCP=C 时，完整 Main KV 分布在 C 个 Prefill endpoints；每个 endpoint 暴露一个 CP-local shard。
+旧路径的问题是只从一个 endpoint 拉取，或把 source block id 直接当成 Decode Host block id，缺少
+`(source_cp_rank, source_block_index) → (host_block_id, token_offset)` 的映射。握手中的
+`remote_scale/local_scale` 差异用于推导传输粒度，不能直接解释为 Host pool 容量少了 C 倍。
 
-### 3.2 新布局
+### 3.2 最小修改方案
 
-把 Host pool 布局版本升级为 v2，并显式区分 logical block 与 ingress physical page：
-
-```text
-logical_blocks       = kv_cache_config.num_blocks
-ingress_scale        = P_DCP * P_PCP          # 首期 PCP 固定为 1
-physical_pages       = logical_blocks * ingress_scale
-physical_page_bytes  = Prefill handshake 中单个 Main page 的字节数
-
-physical_page(logical_block, source_cp_rank)
-    = logical_block * ingress_scale + source_cp_rank
-```
-
-内存可以保持一段连续 shared segment，但 K/V view 改为 physical-page view：
+**不新建 v2 Host pool，不改变现有 shared segment 的申请、K/V shape 和 attention view。** Prefill
+DCP shard 仍写入 Decode 已经分配好的 Host block，只在 connector 构造 Mooncake transfer list 时计算
+目标 block 和 block 内 token offset：
 
 ```text
-[physical_pages, physical_page_tokens, 1, width]
+source shard: (source_cp_rank, source_block_index, source_page_bytes)
+destination:  (decode_host_block_id, token_offset_in_block, copy_bytes)
+
+destination_address = host_layer_base
+                    + decode_host_block_id * host_block_stride
+                    + token_offset_in_block * bytes_per_token
 ```
 
-attention 所需的 global view 由相同底层存储 reshape/view 得到。禁止复制第二份完整 Main。
+这正是实验补丁 `54ea583e7` 中 `unified_host_slot()` 与
+`_build_dsa_unified_main_lists()` 的方向：P0～P7 的 CP-local Main pages 被拼到现有 Decode Host block
+的不同 byte ranges，attention 仍读取原来的完整 Host view。它不额外申请一份 Main，也不要求
+model runner 改变内存规划。
 
-### 3.3 布局必须携带的字段
+### 3.3 connector 侧需要校验的现有参数
 
-`DSAHostKVPoolLayout` 增加：
-
-- `layout_version=2`；
-- `logical_num_blocks`；
-- `ingress_scale`；
-- `physical_page_tokens` 和 `physical_page_bytes`；
-- `cp_interleave_size`；
-- `source_dcp_size/source_pcp_size`；
-- `page_order=logical_block_then_cp_owner`；
-- `layout_epoch`。
-
-这些字段全部进入 fingerprint。启动阶段必须同时验证：
+无需扩展 `DSAHostKVPoolLayout`。connector 从已有 Host tensor/layout 和 Prefill handshake 取得下面的
+值，并在构造地址列表时校验：
 
 ```text
-pool.payload_bytes == memory_planner.planned_host_payload_bytes
-pool.total_nbytes <= configured_dram_bytes
-physical_pages * physical_page_bytes == logical_main_capacity_bytes
-remote_main_scale == pool.ingress_scale
-remote_main_page_bytes == pool.physical_page_bytes
+host_block_tokens > 0
+host_block_stride >= host_block_tokens * bytes_per_token
+source_page_bytes % bytes_per_token == 0
+source_page_tokens <= host_block_tokens
+token_offset + source_page_tokens <= host_block_tokens
+所有 source shard 的目标 byte ranges 不越界、不重叠
 ```
 
-alignment reserve 单独计入 `total_nbytes`。这些检查可以避免乘少一次造成缺页，也避免 planner 已按
-全局 page 计费时再乘一次造成 8 倍重复申请。
+这些是传输 plan 的正确性检查，不是新内存布局协议。128 也不应硬编码；它应由
+`source_page_bytes / bytes_per_token` 或现有 block-size metadata 推导。
 
 ### 3.4 Host pool 类的职责边界
 
-`host_pool.py` 只负责：
+`host_pool.py` 继续只负责：
 
 - 连续内存申请、shared segment 创建/映射和 owner 注册；
-- logical block + source shard 到 byte range 的确定性映射；
-- layout fingerprint 和边界检查；
-- 提供 Main ingress view 与 attention global view。
+- 现有 per-layer K/V view 和地址/stride；
+- 现有生命周期与 Mooncake registration。
+
+CP shard 到 Host byte range 的映射放在 connector 的纯函数/helper 中，避免 Host pool 感知 Prefill
+DCP/PCP topology，也避免影响 model runner 和上游 KV cache 接口。
 
 请求生命周期、coverage 和 source release 留在 connector，避免 Host pool 变成第二个 scheduler。
 
-## 4. Indexer：不能继续复用 Main 的物理页规则
+## 4. Indexer：先确认复制语义，不改内存规划
 
-SFA DCP 的 Indexer 是 replicated global view，Main 是按 CP 分片的 source 数据。两者需要不同
-planner。
+SFA DCP 的 Indexer 通常是 replicated global view，而 Main 是 CP-local shard。若实验代码和 checksum
+确认各 P rank 的 Indexer 完整且等价，Decode D_i 继续从 P_i 拉到现有 Indexer buffer 即可，不需要
+expanded cache、不需要修改 ModelRunner allocation，也不需要把 Main 的 CP 拼接规则套到 Indexer。
 
-P8/D1 首期有两种合法 Indexer layout，启动时只能选择其中一种：
-
-1. **page packing**：Decode 一个 manager row 能容纳八个 P physical pages；planner 把 page 0…7
-   写入 row 内不同 slot。
-2. **expanded physical view**：Decode Indexer cache spec 分配 `logical_blocks * ingress_scale` 个
-   physical pages，并使用与 replicated block table 一致的编号。
-
-当前现场 `remote_scale=8 / local_scale=1 / token_scale=1` 两种条件都不满足，因此必须调整
-ModelRunner 的 Indexer cache spec/allocation，不能在 connector 中截断。
-
-建议优先复用 `AscendSFADCPMetadataBuilder` 的 replicated block table 编号，选择 expanded physical
-view。这样 P8/D1 ingress 和后续 P8/D8 metadata 使用同一套物理编号。
-
-此外不能仅凭名称假设每个 P rank 都持有完整 Indexer。P endpoint 必须在 handshake 中声明
-`replication=FULL` 和 global coverage；只有验证等价后，才能用 `D_i <- P_i` 分散读取。若 P 端只
-暴露 local shard，Indexer 也必须走多 source 聚合。
+connector 只需在握手/调试校验中确认 Indexer 的 shape、page bytes 和 replication 语义；如果现有
+metadata 暂时不能声明 `replication=FULL`，首期可以用内部断言或测试 checksum 证明，没必要为此先
+扩展公共协议。只有确认 P 端实际暴露的是 local shard，才需要另行设计 Indexer 聚合，不能预先按该
+假设扩大改动范围。
 
 ## 5. Connector 控制面
 
@@ -231,8 +214,8 @@ release 和结果都必须幂等，重复消息只能返回已有状态，不能
 
 Decode DCP=1 时，offload manager 继续使用完整 Host view。需要增加：
 
-- global scheduler block table 到 Host physical page table 的展开；
-- `slot_mapping` 到 v2 Host layout 的转换；
+- Prefill source shard 到现有 Host block 内 byte range 的映射；
+- 保持 Decode 原有 `block_table` 和 `slot_mapping` 口径；
 - TP0 新 Decode token 写入 global Host slot；
 - block 复用时递增/校验 layout epoch，防止读取旧页。
 
@@ -312,11 +295,11 @@ MTP=3 时 `max_num_topk_rows`、selection/membership、current KV descriptor 和
 
 | 文件 | 首期改动 |
 | --- | --- |
-| `host_pool.py` | layout v2、ingress scale、page mapping、双 view、fingerprint v2 |
-| `model_runner_v1.py` | 启动时按 P CP topology 规划 Main/Indexer capacity，绑定 v2 pool |
+| `host_pool.py` | 首期不改布局；仅复用现有 base/stride/shape |
+| `model_runner_v1.py` | 首期不改 Host 内存规划 |
 | `mooncake_dsa_metadata.py` | CP-aware endpoint、source shard、coverage result、release command |
 | `mooncake_connector.py` | 多 source Main fan-in、组件 planner、coverage barrier、两阶段 release |
-| `kv_offload_decode_manager.py` | global/physical block table、v2 slot mapping、epoch/validity gate |
+| `kv_offload_decode_manager.py` | 首期尽量不改；继续消费原有完整 Host view |
 | `sfa_v1.py` | 选择新的 offload+DCP 组合 backend |
 | `sfa_kv_offload.py` | 组合 metadata/impl、MTP/graph 静态 buffer |
 | `context_parallel/sfa_cp.py` | 抽取可复用的 replicated view、remap 和 LSE merge helper |
@@ -367,12 +350,11 @@ MTP=3 时 `max_num_topk_rows`、selection/membership、current KV descriptor 和
 ## 10. 建议的提交拆分
 
 1. `refactor(kv-transfer)`: 增加 CP-aware metadata 和纯函数 page mapping；
-2. `feat(kv-offload)`: Host pool layout v2 与内存规划；
-3. `fix(kv-transfer)`: TP0 multi-source Main +完整 Indexer planner；
-4. `fix(kv-transfer)`: coverage barrier、lease 和 release/abort；
-5. `test(kv-transfer)`: P2/P8 fan-in、缺页和取消回归；
-6. `feat(attention)`: offload+DCP 组合 backend；
-7. `test(attention)`: DCP、MTP、图和精度阶梯。
+2. `fix(kv-transfer)`: TP0 multi-source Main 与 Host block 内 offset mapping；
+3. `test(kv-transfer)`: mapping 边界、P2/P8 fan-in 和缺 shard 回归；
+4. `fix(kv-transfer)`: 必要的 source release 时序修复；
+5. `feat(attention)`: offload+DCP 组合 backend；
+6. `test(attention)`: DCP、MTP、图和精度阶梯。
 
 每个提交都保留 guard，直到它对应的 capability 与回归测试同时存在。实验机可在 feature branch 上
 临时解除 guard，但不能把解除 guard 当成功标准。
@@ -679,11 +661,19 @@ HBM 占用，可能挤压模型/KV cache。
 MTP3 的一个活跃 seq 最多占四行，约 18 MiB/层；128 行约 576 MiB/层/TP worker。此数值只用于说明
 量级，实验机应打印实际 dtype、K/V dim、rows 和层数后再核算。
 
-### 13.5 多 TP 并行写 Host pool 的推荐数据面
+### 13.5 多 TP 并行写 Host pool：正确性完成后的独立性能阶段
 
-第一版建议改成 **D 侧多 writer pull**，暂不做 P 侧主动 push。对 P8/D1、D TP=8：DTP_i 同时从
-P_i 拉 Indexer 和 Main，并把 Main 写到 Host row 内属于 CP_i 的不重叠 128-token slice。这样可以复用
-当前 pull 协议和 Decode scheduler 的 `results_by_rank` 聚合，同时消除 TP0 对八个 source 的串行 fan-in。
+**当前实现不做多 writer。** Host pool 仍由 Decode TP0 申请和注册，Main 仍由 Decode TP0 从 P0～P7
+聚合后写入；其他 D TP ranks 只处理现有职责。当前分支只修 TP0 构造的 transfer lists 和目标 byte
+offset，并保留现有 pool API、owner guard 和生命周期。
+
+只有下面的正确性矩阵全部通过，才能另开性能分支评估多 TP writer：P8/D1 与 P8/D8、MTP0 与
+MTP3、eager 与 FULL graph、跨 128/1024 边界、长上下文、并发、source block 复用，以及与 DCP1
+基线逐 token 对齐。当前结果中 P8/D8 UNIQUE ladder 仍未闭环，所以尚未达到该门槛。
+
+门槛通过后的候选方案才是 **D 侧多 writer pull**。对 P8/D1、D TP=8：DTP_i 同时从 P_i 拉
+Indexer 和 Main，并把 Main 写到 Host row 内属于 CP_i 的不重叠 slice。它用于消除 TP0 对八个 source
+的串行 fan-in，不属于当前正确性补丁。
 
 ```mermaid
 flowchart LR
@@ -699,15 +689,17 @@ flowchart LR
     C --> R[READABLE]
 ```
 
-这里 TP0 仍是 shared segment 的**分配和生命周期 owner**，但不再是唯一数据 writer。当前
+在该未来方案中，TP0 仍是 shared segment 的**分配和生命周期 owner**，但不再是唯一数据 writer。当前
 `DSAHostKVPool.register()` 会拒绝非 owner rank，这正是实现多 writer 前必须修改的接口：每个 D TP
 rank 要把本进程看到的 shared segment local VA 注册到自己的 Mooncake engine；segment create/close
 仍只允许 owner。退出时先让所有 rank unregister 本地 engine mapping，再由 owner 释放 segment。
 
-需要新增或扩展的接口如下：
+多 writer 是后续性能优化，不是当前地址映射修复的前置条件。正确性矩阵通过且实测 TP0 fan-in
+成为瓶颈后，再以最小
+差异扩展现有接口：
 
-1. `host_pool.py`：拆分 `allocate_owner()`、`register_local_writer(engine)`、
-   `unregister_local_writer()`、`close_owner()`，启动时 all-gather layout fingerprint 和注册结果；
+1. `host_pool.py`：不拆 allocation/close API；只放宽 `register()` 的 owner 限制，使映射同一 shared
+   segment 的各 D TP rank 可向自己的 Mooncake engine 注册本地 VA，owner-only create/release 保持不变；
 2. planner：生成 `MainShardPlan(request_id, epoch, source_rank, writer_rank, src_blocks,
    dst_ranges, expected_bytes)`，I/O 前证明范围不重叠、没有越界且 union 等于 expected range；
 3. worker：每个 DTP 执行自己的 Indexer+Main plan，DMA 完成后只报告 `LOCAL_DONE`，不直接向 P 发
@@ -726,10 +718,9 @@ rank 写自己的 128-token slice，但 commit coverage、Decode 新 token owner
 
 ### 13.6 合入与实验门槛
 
-1. CPU UT：plan coverage、重复 range、缺 range、越界、epoch mismatch、writer 超时和幂等 abort；
-2. P8/D8 单 writer、MTP0：原始 SSE 结构与 engine token 计数一致，跨边界逐 token 对齐 DCP1；
-3. P8/D8 单 writer、MTP3：draft/target mapping 独立校验，记录各位置条件接受率；
-4. P8/D1 多 writer：1/2/4/8 writer 的传输时间、Host/ROCE 带宽、TTFT、TPOT 和 CPU 占用；
-5. 并发 source-reuse 注入：延迟任一 writer 并强制 P allocator 复用，修复后必须等待 lease 或 fail
-   closed，不能静默输出；
-6. 最后再做 P8/D8 + MTP3 + 多 writer 组合，不把三项变量同时带入首轮定位。
+1. CPU UT：现有 Host block 的目标 offset、边界、重复 range 和缺 source；
+2. P8/D1 TP0 单 writer：MTP0/MTP3、eager/graph、跨边界长 prompt 与 DCP1 逐 token 对齐；
+3. P8/D8 TP0 单 writer：原始 SSE 与 engine token 计数一致，再完成同一正确性矩阵；
+4. 并发与 source block 复用专项验证；若现有完成/释放时序通过，不增加新状态机；
+5. 上述全部完成后另开性能分支，才测试 1/2/4/8 writer 的带宽、TTFT、TPOT 和 CPU 占用；
+6. 多 writer 稳定后再做 P8/D8 + MTP3 + 多 writer 组合。

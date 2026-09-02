@@ -97,6 +97,10 @@ token_offset + source_page_tokens <= host_block_tokens
 CP shard 到 Host byte range 的映射放在 connector 的纯函数/helper 中，避免 Host pool 感知 Prefill
 DCP/PCP topology，也避免影响 model runner 和上游 KV cache 接口。
 
+这里的“只补 connector 映射”直接适用于 P8/D1。对称 P8/D8 下，scheduler block 覆盖的是 DCP
+virtual span，而当前 Host row 仍是 128-token physical page；两者不能继续共用同一个 block-id list。
+第 14 节根据最新错误栈说明必须补的最小 block adapter。它仍不要求重写 Host pool 类。
+
 请求生命周期、coverage 和 source release 留在 connector，避免 Host pool 变成第二个 scheduler。
 
 ## 4. Indexer：先确认复制语义，不改内存规划
@@ -724,3 +728,120 @@ rank 写自己的 128-token slice，但 commit coverage、Decode 新 token owner
 4. 并发与 source block 复用专项验证；若现有完成/释放时序通过，不增加新状态机；
 5. 上述全部完成后另开性能分支，才测试 1/2/4/8 writer 的带宽、TTFT、TPOT 和 CPU 占用；
 6. 多 writer 稳定后再做 P8/D8 + MTP3 + 多 writer 组合。
+
+## 14. 2026-09-02 P8/D8+MTP 错误栈：Host page 与 scheduler block 混用
+
+### 14.1 一手错误与结论
+
+0831 实验分支 `11d01fe84` 上传的标准 aisbench 结果为 P8/D8、MTP 开、FULL graph、2k/256、C4。
+Decode/Pefill 都 Ready，但 EngineCore 在 scheduler 阶段退出：
+
+```text
+_MooncakeDsaDecodeScheduler.update_state_after_alloc
+  bound_blocks = cdiv(bound_tokens, self._main_block_size)
+  if bound_blocks > len(main_block_ids):
+      raise ValueError("vLLM has not allocated enough Main Host blocks")
+```
+
+日志给出的 2k 请求约 `bound_tokens=2060`：
+
+```text
+Host physical page tokens       = 128
+required Host physical pages    = ceil(2060 / 128) = 17
+
+Decode DCP                      = 8
+scheduler virtual span          = 128 * 8 = 1024 global tokens
+allocated scheduler block ids   = ceil(2060 / 1024) = 3
+```
+
+代码拿 `17` 个 Host page 的需求和 `3` 个 scheduler block IDs 比较，因此必然抛错。异常发生在
+`scheduler.schedule() → connector.update_state_after_alloc()`，早于 Mooncake transfer 和模型 forward；
+MTP 不是根因，只是标准 2k 用例把问题稳定暴露出来。
+
+短 smoke/精度 prompt 小于或接近 128 token 时，两边计数可能都为 1，所以能够返回。这解释了上午
+P8/D8 的短请求 5/5 与 UNIQUE/标准压测失败并不矛盾。
+
+### 14.2 三种 block 不能混为一谈
+
+| 名称 | 单位 | P8/D8 中的含义 |
+| --- | --- | --- |
+| kernel/Host physical page | 128 tokens | shared Host tensor 一行，Mooncake 一次 Main page 的寻址粒度 |
+| DCP rank-local physical block | 128 local tokens | 同一个 scheduler id 在每个 DCP rank 的本地 NPU 上各有一片 |
+| scheduler virtual block | 1024 global tokens | 一个 scheduler id 代表 8 ranks × 128-token interleave span |
+
+原生 DCP 的一个 scheduler block id 可以在八块 NPU 上分别索引八份 rank-local storage，因此总共覆盖
+1024 个 global tokens。当前 offload 方案把 Main 收到一段 TP0-owned shared Host memory 后，这八份物理
+storage 不再天然存在；一个 128-token Host row 无法仅凭同一个 scheduler id 表达完整 1024-token
+global span。
+
+### 14.3 `54ea583e7` 的具体差异与断点
+
+实验代码相对 `0827_add_block@d1bf0bad2` 的有效变化可以看到：
+
+1. `RemoteSource` 增加 `remote_dcp_size/remote_pcp_size`；
+2. 新增 `unified_host_slot()`，计算 Prefill CP page 的 global token start；
+3. D TP0 的 `_dsa_gather_main_unified_view()` 遍历 P0～P7 拉 Main；
+4. 解除 Decode DCP guard；
+5. 新增 `cp_local_page_to_unified_index()`，但生产 reader 尚未调用。
+
+当前有四个相互关联的口径错误：
+
+1. `update_state_after_alloc()` 用 128 算 `bound_blocks`，却拿它与 DCP8 scheduler IDs 数量比较；
+2. `_build_dsa_unified_main_lists()` 运行时取得的
+   `_dsa_host_block_tokens = pool.layout.block_size = 128`，而 symmetric UT 手工传入 1024；UT 没覆盖
+   真实运行时配置；
+3. `if dest_index >= len(destination_block_ids): continue` 会静默丢弃超出三个 scheduler IDs 的 Host
+   pages；仅把前面的数量检查放宽会把 2k KV 截成前 384 tokens 后假成功；
+4. fused reader 仍直接使用 `attn_metadata.block_table`，写路径的 unified Host page 编号没有进入
+   `full_kv_block_table`；新增的 `cp_local_page_to_unified_index()` 只在 UT 中使用。
+
+### 14.4 当前不要做的修改
+
+- 不删除或放宽 `vLLM has not allocated enough Main Host blocks` 检查；它阻止了静默缺页。
+- 不把 `bound_blocks` 简单改成 `ceil(tokens / 1024)`，然后继续把三个 scheduler IDs 当三个
+  128-token Host pages。
+- 不把 `dest_index >= len(...)` 的情况继续 `continue`；应带 request、CP rank、global page 和容量
+  信息 fail closed。
+- 不把 128 或 1024 写死。128 来自 Host/handshake page tokens，1024 来自
+  `host_page_tokens * decode_cp_size * decode_pcp_size`。
+- 当前仍不引入多 TP writer；它不能解决 block namespace 和容量口径问题。
+
+### 14.5 TP0 单 writer 下的最小正确设计
+
+保留现有 `DSAHostKVPool` tensor、TP0 allocate/register/write 和 Mooncake pull。新增的只是明确的
+adapter 与容量口径：
+
+```text
+scheduler_block_id b
+    └── virtual global span = host_page_tokens * local_cp_size
+        ├── Host page (b, cp=0)
+        ├── Host page (b, cp=1)
+        └── ... Host page (b, cp=7)
+
+host_page_id = host_page_mapping[b][cp_rank]
+```
+
+不能在未预留空间时直接假设 `host_page_id = b * 8 + cp_rank`，因为 scheduler block IDs 可到
+`num_blocks-1`，简单乘 8 会越过当前 pool 或覆盖其他请求。实现必须二选一：
+
+1. **128-page unified view（更贴近现有代码）**：内存规划明确区分
+   `num_scheduler_blocks` 与 `num_host_pages`，每个在用 scheduler block 预留八个 Host pages；writer 和
+   reader 共用同一映射；
+2. **1024-token Host row**：Host group 真正以 1024-token page 规划和计费，writer 使用 row 内 offset，
+   scheduler 和 reader 都使用同一个 row id。不能只在 UT 里假设 1024，而运行时仍分配 128 row。
+
+第一种对现有 transfer helper 改动较小，但要保证 DRAM 预算按 Host physical pages 计费，并在 fused
+reader 前把 scheduler table 展开为 Host page table。第二种减少 block-table 展开，但会改变 Host page
+shape 和预算，影响面更大。基于社区合入范围，建议先评估第一种。
+
+### 14.6 建议的最小代码改动顺序
+
+1. 先增强现有异常：打印 `bound_tokens`、`host_page_tokens`、`need_host_pages`、
+   `got_scheduler_blocks`、local DCP/PCP 和 pool capacity；同时把越界 `continue` 改成异常；
+2. 增加纯函数 mapping UT，输入使用真实运行时组合：Host page=128、DCP=8、scheduler virtual=1024，
+   覆盖 127/128/129、1023/1024/1025、2060 tokens；
+3. 明确 Host page reservation：得到 `scheduler block → 8 Host pages`，writer 只接收这组 Host page
+   IDs；
+4. fused reader 使用相同 mapping 展开 `full_kv_block_table`，并检查最大 page id 小于 pool rows；
+5. 保持 TP0 单写，先跑 P8/D8 MTP0 eager，再逐项开 MTP3、图、2k/C4 和长上下文；
+6. 全部正确性通过后，才讨论多 TP writer。

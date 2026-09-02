@@ -845,3 +845,54 @@ shape 和预算，影响面更大。基于社区合入范围，建议先评估�
 4. fused reader 使用相同 mapping 展开 `full_kv_block_table`，并检查最大 page id 小于 pool rows；
 5. 保持 TP0 单写，先跑 P8/D8 MTP0 eager，再逐项开 MTP3、图、2k/C4 和长上下文；
 6. 全部正确性通过后，才讨论多 TP writer。
+
+### 14.7 128、1024 和 DCP=8 都是配置派生值
+
+文中的 128、1024 和 8 只是当前实验配方的实例，生产代码不能硬编码：
+
+| 示例值 | 权威来源 | 生命周期 |
+| --- | --- | --- |
+| 128 | local `cache_config.block_size`、KV cache spec、`cp_kv_cache_interleave_size`；remote page 还要由 handshake 校验 | serve 启动后固定 |
+| 8 | local `parallel_config.decode_context_parallel_size`；remote 使用 `remote_dcp_size`，两侧不能默认相等 | serve/remote request topology 固定 |
+| 1 | local/remote PCP size | serve/remote request topology 固定 |
+| 1024 | `128 × DCP8 × PCP1`；在 SFA CP 中对应 CP virtual span，本质是派生值 | 初始化时计算 |
+| 17/3 | `bound_tokens≈2060` 下分别计算的 Host pages / scheduler blocks | 每请求动态变化 |
+
+在当前 PD 配方中，平台要求 `cp_kv_cache_interleave_size == cache_config.block_size`，所以可以看到：
+
+```text
+host_page_tokens = pool.layout.block_size                  # 当前 128
+local_cp_size = local_dcp_size * local_pcp_size            # 当前 8
+cp_cycle_tokens = cp_interleave_tokens * local_cp_size      # 当前 1024
+
+# 与 SFA CP builder 保持一致，不在 connector 自创 1024：
+scheduler_virtual_tokens = lcm(cache_block_tokens, cp_cycle_tokens)
+pages_per_scheduler_block = scheduler_virtual_tokens / host_page_tokens
+```
+
+所有除法都要先检查整除。若 backend 将来允许 `cache_block_tokens != cp_interleave_tokens`，上述 LCM
+公式仍能表达真实 virtual block；代码不能直接写 `host_page_tokens * dcp_size` 作为通用公式。
+
+source 和 destination 必须分别取值：
+
+```text
+source_cp_size       = remote_dcp_size * remote_pcp_size
+source_page_tokens   = remote handshake/cache metadata
+destination_cp_size  = local_dcp_size * local_pcp_size
+host_page_tokens     = local Host pool layout
+```
+
+P8/D1 正是 `source_cp_size=8`、`destination_cp_size=1`；P8/D8 才是两者都为 8。不能用 local DCP
+替代 remote DCP，也不能因为本轮对称就省略这两个字段。
+
+这里的“动态分配”分两层：
+
+1. **启动时静态规划**：根据 serve 配置和 DRAM budget 一次性创建 Host pool，确定 page tokens、总页数
+   和 pages-per-scheduler-block。FULL graph 运行期不能改变 shape 或重新申请 pool；
+2. **请求级动态 reservation/mapping**：根据 `bound_tokens` 和 scheduler 实际返回的 block IDs，为请求
+   选择已预分配的空闲 Host pages，形成 `scheduler_block_id → host_page_ids`。请求结束后归还这些页，
+   而不是扩容 tensor。
+
+因此正确实现是“配置驱动的固定容量 + 请求驱动的动态页映射”，不是为每个 prompt 动态申请一块新的
+Host 内存。UT 中可以使用 128/8/1024 作为一个具体用例，但还必须参数化覆盖 DCP1/2/8 和 backend
+支持的其它 block sizes；生产路径只能读取 config、KV spec 和 handshake。

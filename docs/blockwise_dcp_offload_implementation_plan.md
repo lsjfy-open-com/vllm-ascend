@@ -444,3 +444,150 @@ layout 或 CP interleave 语义。握手应显式携带并校验：
 P8/D8 需要另一个提交接入 DCP-aware block table、slot mapping、新 token writer contract 和 attention
 组合逻辑，不能通过去 guard 与 P8/D1 同批验证。MTP3 与图模式继续位于 A3/A4，等待 eager MTP0 的
 coverage 和 token 对齐通过后再开。
+
+## 12. 2026-09-02：实验现象、h0–h7 与状态机复核
+
+实验侧反馈 `54ea583e7` 已通过 128/512/2k prompt 冒烟，MTP3 的 draft accept 平均约 30%–40%，
+第二位置约 0.5。该结果证明当前低并发配方能够完成服务和请求，也说明 Main 多 source gather 至少覆盖
+了这些样本；它还不能覆盖 source block 提前复用、缺页 fail-open 和 D=8 reader 等并发/负向风险。
+
+### 12.1 `54ea583e7` 的改动范围
+
+生产代码共四个文件：
+
+| 文件 | 函数或接口 | 实际作用 |
+| --- | --- | --- |
+| `mooncake_dsa_unified_view.py`（新增） | `prefill_rank_for_cp_rank()` | CP rank → Prefill endpoint；当前只允许 PCP=1 |
+| 同上 | `unified_host_slot()` | `(source page, CP rank)` → `(Host destination index, token offset)` |
+| 同上 | `tokens_per_page()` | 由 page/Host bytes 比例推断 Prefill page tokens |
+| 同上 | `cp_local_page_to_unified_index()` | DCP-local block → unified index；当前没有接入 reader |
+| `mooncake_dsa_metadata.py` | `RemoteSource.remote_dcp_size/remote_pcp_size` | 把 Prefill CP topology 带到 worker |
+| `mooncake_connector.py` | `_dsa_load_remote_handshake()` | 按 endpoint 读取并缓存 base/stride/scale/length/session |
+| 同上 | `_build_dsa_unified_main_lists()` | 为一个 P CP rank 生成 Main D2RH 地址列表 |
+| 同上 | `_dsa_gather_main_unified_view()` | D TP0 遍历 P CP endpoints 并执行 Main pull |
+| 同上 | `_execute_dsa_receive()` | Indexer 完成后，Host owner 进入 Main gather |
+| 同上 | `_build_dsa_transfer_lists()` | 放宽非对称 scale；当前仍以 `min()` 截断 Indexer |
+| 同上 | `_MooncakeDsaDecodeScheduler.get_num_new_matched_tokens()` | 构造带 remote CP size 的 `RemoteSource` |
+| 同上 | `MooncakeConnector.__init__()` | 把 DCP/PCP 硬拒绝改成 warning |
+| 同上 | `MooncakeConnectorWorker.register_kv_caches()` 相关初始化 | 把 runner Host pool block tokens 传给 receive thread |
+| `sfa_kv_offload.py` | `AscendSFAKVOffloadImpl.__init__()` | 删除普通 `enable_cp()` 拒绝，仍拒 `enable_dsa_cp` |
+
+另外修改两个 UT 文件，增加 metadata 与纯映射测试；六个文件属于实验文档/发布脚本。没有修改 Host
+pool allocator、KV offload manager、fused overlap block-table builder 或 Mooncake 传输引擎接口。
+
+### 12.2 h0–h7 到底是什么
+
+h0–h7 是设计图使用的**全局顺序目标区域**，不是源码对象名，也不是只记录关系、不搬数据的映射表。
+planner 先算映射，Mooncake 随后把字节直接写进这些目标区域；fan-in 本身就是最终聚合，不存在“先写
+h0–h7，再做一次 memcpy 聚合”的下一步。
+
+P8/D1、Prefill page=128 token、Host block=128 token 时，对 local source page `j`：
+
+```text
+global page index = j * 8 + cp_rank
+P0.page[j] -> destination_block_ids[j*8+0]   # 图中的 h0（j=0）
+P1.page[j] -> destination_block_ids[j*8+1]   # 图中的 h1
+...
+P7.page[j] -> destination_block_ids[j*8+7]   # 图中的 h7
+```
+
+这里的 h0–h7 是最终 Host pages，但真实物理 block ID 取自 allocator，未必连续。Decode DCP1 的
+`block_table` 按全局 token 顺序直接读这些 pages。
+
+若未来 P8/D8 的 Host scheduler row 是 1024 token，则 h0–h7 更准确地表示同一个 Host row 的八个
+128-token slice：`H[j] + rank*128*token_bytes`。它们不再是八个独立 Host blocks。当前代码能生成这种
+写地址，但 D 侧 reader 还没有消费 `cp_local_page_to_unified_index()`，所以不能据此认定 P8/D8 已闭环。
+
+### 12.3 当前真实数据面：多 source、单 Host writer
+
+当前不是 P ranks 主动并行写 D Host：
+
+```mermaid
+flowchart LR
+    P0[P0 Main in NPU] -->|Mooncake read| O[D TP0 receive thread]
+    P1[P1 Main in NPU] -->|Mooncake read| O
+    PX[P2...P7 Main in NPU] -->|逐 endpoint read| O
+    O -->|写最终 global regions| H[shared Host Main]
+    PI[P_i Indexer in NPU] -->|D_i 独立 pull| DI[D_i Indexer HBM]
+```
+
+`_dsa_main_owner` 保证只有 Host pool owner（当前 TP0）写 Main，且
+`_dsa_gather_main_unified_view()` 的 Python loop 逐 CP rank 调用同步 read。因此当前没有 P0～P7 对
+Host 同一地址的并发写竞争。需要保留的风险是地址规划的缺页/重叠，以及 P source 的生命周期。
+
+### 12.4 原状态机能保证什么
+
+| flag/state | 能保证 | 不能保证 |
+| --- | --- | --- |
+| `command_emitted` | Scheduler 对请求只发一次 command | 数据完整、endpoint lease |
+| `_dsa_active_commands` | 单 worker 不重复启动同一 command | 跨 worker/跨 source 的原子提交 |
+| `_dsa_main_owner` | shared Host Main 单 writer | Main source 在读取前不被释放 |
+| `batch_transfer_sync_read()` 返回 | 本批传输调用已结束 | 所有 expected pages 都被规划 |
+| `DsaLocalResult(RECEIVE_COMPLETE)` | 本 rank 没看到 transfer API 失败 | coverage=100%、release 完整 |
+| `results_by_rank == expected_tp_ranks` | D 所有 TP worker 都返回 | 每个 P endpoint 的 Indexer+Main 都完成 |
+| `finished_recving` | Scheduler 可解除 remote-KV 等待 | P source 生命周期安全 |
+| P `delayed_free_requests/reqs_to_process` | 收到 DONE 前延迟释放本 rank blocks | 一个 DONE 是否覆盖全部 consumers |
+| `port_send_num` | 旧路径在携带计数字典时等待多个 DONE | DSA 当前传 `{}`，此计数逻辑未启用 |
+| DONE 的 ACK | P endpoint 已处理 DONE | D 已验证全局 coverage 或提交 Host epoch |
+
+D 侧的基本时序是可用的：TP0 的同步 Main gather 返回后才生成 local result，Scheduler 等到所有 Decode
+TP results 后才设置 `finished_recving`，因此正常路径中 Decode 不应在 TP0 fan-in 尚未返回时读取 Host。
+`_dsa_main_owner` 也避免了 Host 多 writer。
+
+原机制**不能保证 P source 生命周期**。对 P_i（i>0），当前可能发生：
+
+```mermaid
+sequenceDiagram
+    participant Pi as Prefill P_i source
+    participant Di as Decode D_i
+    participant D0 as Decode TP0 Host owner
+    Di->>Pi: pull Indexer
+    Di-->>Pi: DONE_RECVING {}
+    Pi->>Pi: 标记 finished，scheduler 可释放/复用 blocks
+    D0->>Pi: 稍后 pull Main
+    Note over D0,Pi: 可能读到已释放或复用的数据
+```
+
+单请求冒烟通常不会立刻复用这些 blocks，所以 128/512/2k 都通过并不矛盾。要关闭该风险，不能让
+各 D_i 在 Indexer 完成后直接释放 P_i。应为每个 endpoint 建立 expected component set：
+`{INDEXER(P_i→D_i), MAIN(P_i→D0)}`；全部 component 完成、全局 coverage 校验通过后，再由一个
+coordinator 向每个 P_i 发送一次 release 并等待 ACK。失败/取消对已取得 lease 的 endpoints 做幂等
+abort/release。
+
+如果未来改成 P0～P7 真正并行 push Host，则还需增加 destination range ownership、request/layout
+epoch、每 shard completion bitmap、memory visibility barrier 和一次性的 `COMMIT_READY`。只有
+`expected == completed_unique`、无 missing/overlap 且 epoch 一致时，reader 才能从 `RECEIVING` 转为
+`READABLE`。
+
+### 12.5 MTP3 接受率的解释
+
+vLLM 的 per-position acceptance 是以所有 draft rounds 为分母的**无条件概率**。后一个 draft token
+被接受的前提是前面的 token 都接受，所以曲线天然单调下降。若 `A0/A1/A2` 是三个位置的接受率：
+
+```text
+mean accepted draft tokens = A0 + A1 + A2
+mean acceptance length     = 1 + A0 + A1 + A2
+reported draft accept      = (A0 + A1 + A2) / 3
+conditional position 2     = A1 / A0，而不是 A1
+```
+
+因此平均 30%–40% 对 MTP3 对应每步平均接受 0.9–1.2 个 draft，加上 target base token，mean
+acceptance length 约 1.9–2.2。第二位置约 0.5 本身不异常；要结合第一位置计算条件概率。此前同分支
+P8/D1+MTP3 的记录是 draft accept 21.1%、mean length 1.63，当前数据反而有所提高。
+
+接受率受 prompt 分布、sampling 参数、并发、W8A8 量化与 MTP draft head 质量影响。它不是 KV
+正确性的单独判据：verifier 会拒绝不匹配 draft，低接受率仍可输出正确 target token；反过来，draft
+和 target 若共同读取错误 KV，也可能保持一定接受率。
+
+验证是否由 blockwise/Host KV 引起，应在实验机固定模型、prompt、seed、temperature 和并发，做：
+
+1. 本地/不走 PD offload 的 MTP3 基线；
+2. P1/D1 blockwise MTP3；
+3. P8/D1 blockwise MTP3；
+4. 对三组记录 `A0/A1/A2`、mean acceptance length、TPOT，并在机内逐 token 对齐 MTP-off target；
+5. 按 prefix 跨 128-page 边界与并发度分桶。如果只有 P8/D1 在边界或并发升高后坍塌，才优先怀疑
+   Host mapping/source reuse；若三组曲线接近，则接受率主要是模型与 workload 属性。
+
+状态机风险的专项实验应使用至少两个并发请求，并在 D_i DONE 后、D0 拉该 rank Main 前注入延迟，
+同时迫使 P allocator 复用旧 blocks。修复前该用例应能暴露 checksum/epoch 不一致；修复后必须稳定
+fail closed 或完整通过。

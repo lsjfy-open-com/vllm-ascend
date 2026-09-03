@@ -1015,3 +1015,121 @@ TP0 writer，并按以下顺序判断是否保留 scheduler 粒度方案：
 若第 2 步仍在 reader/attention 出现首 token 分歧，说明“让 scheduler 多分 Host-page IDs”只解决了
 容量，Indexer 或 SFA DCP reader 仍按 virtual block 解释，此时再加薄的 group-specific adapter；不要
 通过继续扩大平台级 flag patch 掩盖口径差异。
+
+## 16. 2026-09-03：v0.25.1rc1、Main 与 0827 add-block 的 PCP=1 约束
+
+本节按 2026-09-03 拉取的代码核对：
+
+- v0.25.1rc1 tag：`9bf964cb4`；
+- 官方 `releases/v0.25.1rc`：`73953fc05`；
+- 官方 Main：`ec26f0ab8`；
+- 0827 add-block 最新：`587ac6e15`。
+
+结论不是“vLLM Ascend 全局强制 PCP=1”，而是**不同 runner、connector 和 SFA 组合有各自约束**。
+
+### 16.1 官方 v0.25.1rc1 和 Main 的平台入口
+
+v0.25.1rc1 与当前 Main 都有同一个平台校验：
+
+```python
+if not vllm_config.use_v2_model_runner \
+        and parallel_config.prefill_context_parallel_size > 1:
+    raise ValueError(... "Please set --prefill-context-parallel-size to 1")
+```
+
+所以：
+
+- 使用旧 model runner 时，PCP 确实被平台入口强制为 1；
+- 使用 v2 model runner 时，没有这个全局 PCP=1 限制；
+- 这条约束不是 Mooncake 或 DSA 独有。
+
+0827 add-block 把这一入口校验改成了“DP>1 与 PCP>1 不能同时开启”。因此它在平台层面反而比官方
+v0.25.1rc1 放得更宽：DP=1 时允许旧 runner 配 PCP>1。但这只能说明配置能越过入口，不能证明后面的
+DSA offload 路径已经支持。
+
+### 16.2 官方普通 MooncakeConnectorV1 并不强制 remote PCP=1
+
+v0.25.1rc1 和 Main 的普通 `mooncake_connector.py` 都在 `ReqMeta` 中携带 `remote_pcp_size`，并在
+`_get_kv_split_metadata()`、`_get_group_pulls_metadata()` 中处理 PCP/DCP endpoint 和 block 拆分。
+现有 UT 也包含 `remote_pcp_size=2` 的 connector metadata/group-pull 用例。
+
+其关键约束是：
+
+```text
+remote_cp_size = remote_pcp_size × remote_dcp_size
+local_cp_size  = local_pcp_size × local_dcp_size
+remote_cp_size % local_cp_size == 0
+```
+
+另外普通 connector 不允许 PP>1 与本地 PCP>1 同开。这里没有“Prefill remote PCP 必须为 1”的统一
+限制。因此同事 `214c48677` 建议 DSA 复用普通 connector 的 split/group-pull，确实能消除 0827
+临时代码里不必要的 PCP=1 限制。
+
+### 16.3 官方仍存在的局部 PCP=1/CP=1 约束
+
+| 路径 | v0.25.1rc1 | 当前 Main | 约束含义 |
+| --- | --- | --- | --- |
+| Platform + legacy runner | PCP 必须 1 | PCP 必须 1 | PCP 只允许 v2 model runner |
+| Mooncake layerwise Decode 节点 | 本地 PCP 必须 1 | 本地 PCP 必须 1 | Decode 节点不能把 Prefill PCP 当作本地并行模式 |
+| Layerwise 且 P/D block size 不同 | 任一侧有 PCP/DCP 都拒绝 | 同样拒绝 | CP 与异构 block size 的组合未支持 |
+| Mooncake Hybrid Connector | 本地 `PCP×DCP==1` | 同样 | 该专用 connector 不支持 CP |
+| recompute CPU offload | PCP=1 且 DCP=1 | 同样 | 与本次 DSA Host offload 不是同一路径 |
+
+所以讨论“官方支持 PCP”时必须带上具体路径。普通 MooncakeConnectorV1 能处理 PCP metadata，不代表
+Mooncake Hybrid、layerwise 异构 block size或 recompute offload 自动支持。
+
+### 16.4 0827 add-block 新增了两处与本项目直接相关的硬限制
+
+第一处在 `mooncake_dsa_unified_view.prefill_rank_for_cp_rank()`：
+
+```python
+if remote_pcp_size != 1:
+    raise ValueError("DSA unified view MAIN gather requires Prefill PCP=1")
+```
+
+该函数把 `cp_rank r` 直接映射为 Prefill TP rank `r`，并假设 replica 位于 `r+k×cp`。这个简化只描述
+PCP=1、DCP shard 的拓扑；PCP 的 token/head-tail 拆分与 endpoint 排布不能用同一公式表达。因此这是
+0827 DSA unified-view 临时 planner 的限制，不是官方普通 Mooncake 的限制。
+
+第二处在 0827 分支的 `AscendSFADCPMetadataBuilder`：
+
+```python
+assert self.pcp_size == 1, \
+    "AscendSFADCPMetadataBuilder only supports DCP without PCP."
+```
+
+这表示该实验分支支持 PCP 单开、DCP 单开，但 **SFA PCP+DCP 同时开启**明确没有组合实现。Decode DSA
+初始化处目前只对 `dcp_size * pcp_size != 1` 打 warning，并不会在入口拒绝；随后仍可能在 SFA builder
+中触发断言。因此不能把启动时的 warning 理解为 PCP+DCP 已支持。
+
+### 16.5 当前 Main 的变化与仍需注意的边界
+
+当前 Main 已增加独立的 `AscendSFAPCPImpl`，并增加 DSA-CP 与 DCP 的组合 builder；普通 PCP 单开比
+v0.25.1rc1 更完整。Main 的 `AscendSFADCPMetadataBuilder` 已没有 0827 分支那条 `pcp_size==1` 显式
+断言。
+
+但 Main 的 SFA resolver 在 DCP 开启时优先选择 DCP implementation，而 DCP block view 的
+`total_cp_size` 仍只使用 `dcp_size`；现有代码和测试中没有看到 SFA PCP+DCP 同开闭环。因此 Main
+“删除显式断言”不能直接等价为“PCP+DCP 已验证支持”。在本项目中应分别声明：
+
+- **Prefill PCP>1、Decode PCP=1/DCP=1**：普通 Mooncake metadata 层有基础能力；DSA Main gather 需要
+  去掉自定义 `prefill_rank_for_cp_rank()`，复用通用 split/group-pull；
+- **Prefill PCP>1、Decode DCP>1**：除 connector 拆分外，还需要验证或实现 SFA PCP prefill 与 DCP
+  decode 的两侧独立语义，不能仅删除断言；
+- **同一 Decode 实例 PCP>1 与 DCP>1**：当前不应列为已支持配置。
+
+### 16.6 对当前分支的最小修改意见
+
+当前阶段不要简单删除 `remote_pcp_size != 1` 后继续使用 `return cp_rank`。正确的小范围修改是：
+
+1. DSA 请求保留完整 `ReqMeta.remote_pcp_size/remote_dcp_size/remote_ptp_size`；
+2. 由普通 Mooncake `_get_kv_split_metadata()` 和 `_get_group_pulls_metadata()` 生成 Prefill PCP/DCP
+   endpoint 子任务；
+3. Main 子任务当前仍全部交给 Decode TP0 写 Host；
+4. Indexer 子任务保持普通 connector 的 group-pull 结果；
+5. 增加 P-PCP2/D1、P-PCP2+DCP2/D1 的纯 metadata UT；
+6. NPU 实验先验证 Prefill PCP2/Decode DCP1，之后才验证 Prefill PCP2/Decode DCP>1；
+7. 若仍使用 legacy model runner，平台入口会先拒绝 PCP>1，实验脚本必须明确 v2 model runner。
+
+因此，0827 add-block 当前“PCP=1”是实质约束，但主要来自它自建的 DSA Main topology helper；官方
+普通 MooncakeConnectorV1 并没有同样的 remote PCP=1 限制。迁移时应替换 planner，而不是只删 guard。

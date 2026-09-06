@@ -1133,3 +1133,157 @@ v0.25.1rc1 更完整。Main 的 `AscendSFADCPMetadataBuilder` 已没有 0827 分
 
 因此，0827 add-block 当前“PCP=1”是实质约束，但主要来自它自建的 DSA Main topology helper；官方
 普通 MooncakeConnectorV1 并没有同样的 remote PCP=1 限制。迁移时应替换 planner，而不是只删 guard。
+
+## 17. 1M 上下文：Host 容量、64 GiB MR 与 TP/DCP 分片
+
+### 17.1 先区分三个容易混淆的“大小”
+
+1. **Host pool 容量**：CPU DRAM 中实际保存 Main KV 的字节数；当前同一 DP 域内由 TP0 创建共享段，
+   其他 Decode TP 映射同一物理段，不应按 TP 数重复计算物理容量。
+2. **RDMA Memory Region（MR）大小**：一次 `register_memory(addr, size)` 注册的连续地址区间。某些
+   RoCE NIC/驱动的 `max_mr_size` 是 64 GiB；这是设备/驱动能力，不是 RoCE 协议统一规定的“单 TP
+   最多只能有 64 GB 内存”。
+3. **TP/DCP 的数据所有权**：哪个 rank 写、存、读哪些 KV page。把一次注册切成多个 MR 只解决
+   `max_mr_size`，并不会自动把 KV 容量分摊到多个 TP。
+
+实验机应先确认实际限制，而不是默认 64 GB：
+
+```bash
+ibv_devinfo -v | grep -i max_mr_size
+ulimit -l
+dmesg -T | grep -i -E 'mr size|register memory|mkey|infiniband|rdma'
+rdma resource show
+```
+
+Mooncake 官方 troubleshooting 给出的典型内核值 `68719476736` 是 64 GiB，并建议把大注册区间拆成
+不超过 `max_mr_size` 的多个 region。还要单独检查 memlock、MKEY 数量和残留资源；“每段都小于
+64 GiB”并不能保证注册总量与 MKEY 一定充足。
+
+当前 `49ba0a0c3` 仍在每个 Decode TP 上执行一次：
+
+```python
+engine.register_memory(pool.data_ptr, pool.nbytes)
+```
+
+因此它的多 TP writer 提升了并行传输能力，但每个 TE 仍注册完整 pool。1M pool 大于 64 GiB 时，
+所有 rank 都可能在同一个单 MR 上限处失败；这还不是容量分片。
+
+### 17.2 GLM-5.2 Main KV 的 1M 容量
+
+以当前运行时观测到的 Main KV 为准：`K width=512`、`V width=64`、Host dtype 为 BF16（2 B）。
+W8A8 是权重量化，不会把此处 Main KV 自动变成 1 byte。计算必须使用运行时
+`layout.k_width/v_width/num_layers/block_size/dtype`，下列数字只是当前 GLM-5.2 配置的展开结果：
+
+```text
+blocks(T) = ceil(T / block_size)
+bytes/block/layer = block_size × (K_width + V_width) × dtype_bytes
+raw_host_bytes = blocks × bytes/block/layer × host_layers
+```
+
+当 `T=1,024,000`、`block_size=128` 时，恰好是 8000 blocks；每 block、每层为 144 KiB。
+
+| Host 层数 | 原始 Main KV | 按当前 K/V plane 逐层 2 MiB 对齐后 | 含义 |
+| ---: | ---: | ---: | --- |
+| 78 | 85.69 GiB | 85.77 GiB | 只包含 78 个 target layers |
+| 79 | 86.79 GiB | 86.87 GiB | 保守计入 1 个 MTP cache layer |
+
+如果“1M”指二进制 `1,048,576` tokens，则相应为 87.75 GiB（78 层）或 88.875 GiB（79 层）。
+MTP=3 不代表 KV 容量乘 3；是否多出 cache layer 由运行时 `offload_names/layout.num_layers` 决定。
+
+单个满长请求建议给每个 DP 域配置 96–100 GiB 的 Host Main 预算，给 null block、对齐、分配器、
+元数据和运行波动留余量。两个并发满长请求仅 Main KV 就约 174 GiB，工程预算应至少 192 GiB；
+Indexer HBM、模型权重、graph buffer、workspace 和操作系统内存仍需另算。
+
+当前 planner 的 `max_num_seqs × max_blocks_per_request` 是最坏情况上界。对 1M 服务不能只依赖
+`max_num_seqs`，应按每个 DP 域正在占用与预留的 token/block 总数做 admission control：短请求可并发，
+但不能让多个长请求先入队、到 Host 分配阶段才失败。
+
+### 17.3 三个递进方案
+
+#### A. TP0 owner + 多 MR（先做，最小改动）
+
+保持一个逻辑 Host pool 和现有地址公式，只把注册区间按完整 layer 边界切成多个 MR。chunk 大小由
+运行时 `max_mr_size`、`layout.layer_stride` 和安全余量推导，不能硬编码 64 GiB 或固定层数。建议目标
+MR 不超过 32–48 GiB；1M 通常形成 2–3 个 MR。
+
+传输描述符必须完全落在某个已注册 MR 内；若描述符可能跨边界，提交前必须再切一次。按完整 layer
+切分可使当前逐层 K/V block transfer 自然不跨界，改动集中在 register/unregister 与边界校验，不改变
+block table、Host layout 或 fused reader。这个阶段仍由 TP0 写，优先证明 1M 正确性。
+
+#### B. 统一 pool + 多 TP writer + 多 MR（第二步）
+
+在 A 验证稳定后恢复 `49ba0a0c3` 的多 TP writer。每个 Decode TP 的本地 TE 至少注册自己将写入的
+地址范围。当前 CP shard 在全局 Host page 中交错，若不改变布局，“只注册自己的范围”会产生大量
+离散小 MR；因此短期可以让每个 TE 注册相同的 2–3 个大 MR，先换取带宽，但需监控 MKEY、memlock
+和注册启动时间。它提升带宽，物理 Host 容量仍是一份约 87 GiB。
+
+#### C. DCP rank-local Host pool（1M 容量与 SLO 的目标方案）
+
+对称 `P-DCP == D-DCP` 时，让每个 Decode DCP/TP rank 只分配、注册并读取自己的 CP-local pages：
+
+```text
+global logical block = local_block × dcp_size + dcp_rank
+rank-local Host index = local_block
+```
+
+DCP8 时，一个 1,024,000-token 请求在每个 rank 约 1000 blocks，79 层 Main KV 约 10.86 GiB；不再有
+单 rank 87 GiB 注册，也不需要 TP0 汇聚。Prefill cp_i 直接写 Decode rank_i 的最终 Host 地址，Decode
+SFA 使用本地 block table 读取，本层 partial output/LSE 再走已有 DCP reduction。
+
+```mermaid
+flowchart LR
+  subgraph P[Prefill DCP8]
+    P0[cp0 pages] --- P1[cp1 pages] --- P7[cp7 pages]
+  end
+  subgraph D[Decode DP domain: DCP8]
+    H0[rank0 Host pool\n~10.86 GiB] --> S0[rank0 SFA]
+    H1[rank1 Host pool\n~10.86 GiB] --> S1[rank1 SFA]
+    H7[rank7 Host pool\n~10.86 GiB] --> S7[rank7 SFA]
+  end
+  P0 -->|Mooncake direct| H0
+  P1 -->|Mooncake direct| H1
+  P7 -->|Mooncake direct| H7
+  S0 --> R[DCP output/LSE reduction]
+  S1 --> R
+  S7 --> R
+```
+
+这一步会改变 Host physical index 的解释，需要 rank-local allocator、metadata/fingerprint、transfer
+planner、reader/block-table remap 和生命周期覆盖测试，改动明显大于多 MR。不要把它与 A 混在一次
+提交中。非对称 `P-DCP8/D-DCP1` 下 D0 仍需接收全部约 87 GiB，只能依靠 A 的多 MR；因此 1M 的
+理论最优路径优先保持 P/D DCP 对称。
+
+### 17.4 单 DP 域与多 DP 域
+
+DP 域是独立的调度、block namespace 和 KV pool 容量域。TP/DCP 在域内共同处理一个请求；普通 DP
+不会把一个 1M 请求拆到多个 DP 域。
+
+| 方案 | 1M 请求容量 | 排队与 SLO | Host 代价 |
+| --- | --- | --- | --- |
+| DP1 + DCP8/16 | 一份 96–100 GiB 预算；rank-local 后分散到 8/16 rank | 单个超长请求路径最简单，但容易阻塞同域短请求 | 最低 |
+| DP4 + 每域可接 1M | 每个域都必须各有 96–100 GiB；DP4 不能把四个不足 1M 的 pool 拼成一个 | 可把并发长请求分到不同域，降低排队尾延迟 | 约 384–400 GiB Host Main 预算 |
+| 长短请求分池 | 1–2 个大容量 long-context DP 域，其余域服务短请求 | 避免 1M 请求造成 head-of-line blocking，通常总体 SLO 最好 | 按流量配置，利用率更高 |
+
+共享一个 Host pool 给多个 DP scheduler 会引入 block-id 命名空间、引用计数、回收和 NUMA/NIC 竞争，
+不适合作为本次 connector 的小范围修改。更稳妥的是请求级路由：一个请求固定归属一个 DP 域，按
+`reserved_blocks` 和预计传输时间选择域。
+
+### 17.5 blockwise 下的 SLO 选择
+
+blockwise 在 Prefill 完成后才提交整批 Main KV，不能获得 layerwise 的逐层计算/传输重叠；其 TTFT
+下界至少包含完整 KV 传输。约 86.9 GiB 在单条 100/200/400 Gb/s 链路上的纯线速下界约为
+6.95/3.48/1.74 秒，尚未计入协议、NPU copy、Host DRAM 和拥塞。多 TP 只有绑定到独立 NIC/rail 时
+才会接近带宽叠加；八个 TP 共用一张 NIC 时，八路并发只会增加队列和尾延迟。
+
+推荐顺序：
+
+1. TP0-only + 动态多 MR，先验证 1M 准确性、注册/注销与长稳；
+2. 保持统一地址视图，按 1/2/4/8 writers 扫描吞吐与 p99，writer 数匹配真实独立 NIC/NUMA rail；
+3. 对称 P/D DCP 下实现 rank-local Host pool，消除 TP0 汇聚和全 pool 重复注册；
+4. 每 DP 域做 block/token admission control，长短请求分 lane；
+5. 分别度量 Prefill compute、P→D Main、D-side ready barrier、首 token 和 steady TPOT。MTP 接受率低时
+   还要比较 MTP1 与 MTP3；它主要影响 TPOT，不应掩盖 1M Main transfer 的 TTFT。
+
+在当前阶段，**最小且可合社区的改动是 A**；理论 SLO 目标是 **C + 对称 DCP + NIC/NUMA locality +
+请求级 DP 路由**。直接把 TP 数加大但仍让每个 TP 注册完整 87 GiB pool，既解决不了 64 GiB 单 MR，
+也不是容量扩展。

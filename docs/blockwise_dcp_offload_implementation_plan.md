@@ -1272,7 +1272,7 @@ DP 域是独立的调度、block namespace 和 KV pool 容量域。TP/DCP 在域
 
 blockwise 在 Prefill 完成后才提交整批 Main KV，不能获得 layerwise 的逐层计算/传输重叠；其 TTFT
 下界至少包含完整 KV 传输。约 86.9 GiB 在单条 100/200/400 Gb/s 链路上的纯线速下界约为
-6.95/3.48/1.74 秒，尚未计入协议、NPU copy、Host DRAM 和拥塞。多 TP 只有绑定到独立 NIC/rail 时
+7.46/3.73/1.87 秒，尚未计入协议、NPU copy、Host DRAM 和拥塞。多 TP 只有绑定到独立 NIC/rail 时
 才会接近带宽叠加；八个 TP 共用一张 NIC 时，八路并发只会增加队列和尾延迟。
 
 推荐顺序：

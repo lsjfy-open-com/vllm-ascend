@@ -1217,7 +1217,7 @@ block table、Host layout 或 fused reader。这个阶段仍由 TP0 写，优先
 离散小 MR；因此短期可以让每个 TE 注册相同的 2–3 个大 MR，先换取带宽，但需监控 MKEY、memlock
 和注册启动时间。它提升带宽，物理 Host 容量仍是一份约 87 GiB。
 
-#### C. DCP rank-local Host pool（1M 容量与 SLO 的目标方案）
+#### C. DCP rank-local Host pool（可选的物理容量分片，不是当前并行写的前提）
 
 对称 `P-DCP == D-DCP` 时，让每个 Decode DCP/TP rank 只分配、注册并读取自己的 CP-local pages：
 
@@ -1253,6 +1253,40 @@ planner、reader/block-table remap 和生命周期覆盖测试，改动明显大
 提交中。非对称 `P-DCP8/D-DCP1` 下 D0 仍需接收全部约 87 GiB，只能依靠 A 的多 MR；因此 1M 的
 理论最优路径优先保持 P/D DCP 对称。
 
+需要特别说明：开 DCP 会切分计算侧/NPU KV，并不会自动把当前统一 Host pool 变成八份。当前项目要求
+的 TP0–7 并行写可以继续使用一份统一 Host pool；只有在多 MR 后仍受到总注册量、NUMA 或 NIC 资源
+限制时，才需要考虑 C。不能为了“并行写”提前引入 rank-local allocator。
+
+### 17.3.1 当前 TP0–7 并行写的准确含义
+
+当前控制面只分配一次 request 的全局 Host block IDs，并把同一列表交给各 Decode TP。各 TP 不运行
+独立 Host allocator，也不独立回收 request。数据面通过确定性所有权切分传输任务：
+
+```text
+dest_index = src_local_page × DCP + cp_rank       # block_size = kernel page = 128 时
+TP_i owns cp_rank i                               # P-TP8 / D-TP8 / DCP8
+```
+
+因此第一个 CP-local page group 的落点为：
+
+```text
+TP0/cp0 -> H[0]    TP1/cp1 -> H[1]   ...   TP7/cp7 -> H[7]
+TP0/cp0 -> H[8]    TP1/cp1 -> H[9]   ...   TP7/cp7 -> H[15]
+```
+
+这些地址都属于同一个共享 Host pool，但互不重叠，可以真正并行写。这里“TP 管理自己的地址”只表示
+它拥有这批 transfer descriptors；Host block 的分配、请求引用计数、释放和 ready 状态仍是域内统一
+管理。只有所有 participating TP 都报告 MAIN_D2RH 完成后，控制面才能把 request 发布为可读。
+
+统一寻址本身没有 64 GiB 限制。限制来自当前把整个连续虚拟地址区间一次传给
+`register_memory(base, pool.nbytes)`。同一个 87 GiB 逻辑地址空间可以按 layer 边界注册成例如三个 MR，
+而 block 地址公式保持 `base + layer_offset + block_id * stride + token_offset` 不变。
+
+block table 也不是 1M 的容量瓶颈。按 128 tokens/page，一个 1,024,000-token request 的全局 view 是
+8000 个 `int32` block IDs，仅 31.25 KiB；DCP8 的 scheduler-local row 约 1000 个 IDs，即 3.91 KiB，
+临时 replicated view 再展开为约 31.25 KiB。即使 `max_num_seqs=32` 再加一个 graph padding row，完整
+replicated buffer 也约 1.01 MiB。真正占用约 87 GiB 的是这些 IDs 指向的 79 层 K/V payload。
+
 ### 17.4 单 DP 域与多 DP 域
 
 DP 域是独立的调度、block namespace 和 KV pool 容量域。TP/DCP 在域内共同处理一个请求；普通 DP
@@ -1279,11 +1313,12 @@ blockwise 在 Prefill 完成后才提交整批 Main KV，不能获得 layerwise 
 
 1. TP0-only + 动态多 MR，先验证 1M 准确性、注册/注销与长稳；
 2. 保持统一地址视图，按 1/2/4/8 writers 扫描吞吐与 p99，writer 数匹配真实独立 NIC/NUMA rail；
-3. 对称 P/D DCP 下实现 rank-local Host pool，消除 TP0 汇聚和全 pool 重复注册；
+3. 在统一 pool 上验证 TP0–7 并行写，并确认 complete barrier 覆盖所有 participating TP；
 4. 每 DP 域做 block/token admission control，长短请求分 lane；
 5. 分别度量 Prefill compute、P→D Main、D-side ready barrier、首 token 和 steady TPOT。MTP 接受率低时
    还要比较 MTP1 与 MTP3；它主要影响 TPOT，不应掩盖 1M Main transfer 的 TTFT。
 
-在当前阶段，**最小且可合社区的改动是 A**；理论 SLO 目标是 **C + 对称 DCP + NIC/NUMA locality +
-请求级 DP 路由**。直接把 TP 数加大但仍让每个 TP 注册完整 87 GiB pool，既解决不了 64 GiB 单 MR，
-也不是容量扩展。
+在当前阶段，**最小且可合社区的容量修复是 A**；blockwise 的 SLO 目标是 **B + 对称 DCP +
+NIC/NUMA locality + 请求级 DP 路由**。C 只在确认统一 pool 的总注册量或物理拓扑成为瓶颈后再考虑。
+直接把 TP 数加大但仍让每个 TP 以单 MR 注册完整 87 GiB pool，解决不了 64 GiB 单 MR；但改成动态
+多 MR 后，仍可在统一 pool 上实现 TP0–7 的不重叠并行写，无需先重写 Host allocator。
